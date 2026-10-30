@@ -24,14 +24,13 @@ The package has two layers:
 - Text cleanup: remove accents and diacritics (including Arabic Tashkeel), control characters and ignorable characters, lump similar punctuation, create URL slugs
 - Words, and line wrapping by display width (including East Asian text without spaces)
 - Sorting, comparing and searching that ignore case, accents and width differences
-- Trim of all the Unicode white space, and find and replace by whole characters (safe for strings that contain `char(0)`)
+- Trim of all the Unicode white space, and find and replace by whole characters
 - Arabic text: remove Tashkeel and Tatweel, unify the Alef forms, normalize presentation forms and ligatures, search and sort ignoring these differences
 - Digits of all the scripts: convert between ASCII, Arabic-Indic and Persian digits, and get the value of any decimal digit
 - Arabic shaping (presentation forms and Lam-Alef ligatures, also for Persian and Urdu letters) and bidirectional visual order, for Windows Terminal, game engines (RayLib, SDL, Allegro) and simple PDF writers
 - UTF-8 validation and replacing invalid bytes with U+FFFD
 - Fast: the loops over characters run in C (200,000 characters are measured or wrapped in a few milliseconds)
 - Tested on Windows (x64) and Linux (x64) with the same results, with unit tests and a fuzz test
-- Binary safe: strings may contain `char(0)`
 - Direct access to the utf8proc functions and options
 
 ## Installation
@@ -131,7 +130,7 @@ Functions that process strings raise a Ring error that starts with `utf8proc Err
 
 ### Trim, Find and Replace
 
-These functions work on whole user-perceived characters, so `"e"` is not found inside `"e"` + combining accent, and `"👩"` is not found inside the family emoji `"👨‍👩‍👧"`. They are safe for strings that contain `char(0)`.
+These functions work on whole user-perceived characters, so `"e"` is not found inside `"e"` + combining accent, and `"👩"` is not found inside the family emoji `"👨‍👩‍👧"`.
 
 | Function | Description |
 |----------|-------------|
@@ -334,26 +333,6 @@ See the folder `ring/samples/UsingUTF8Proc`:
 | `test30_arabic_terminal.ring` | Printing Arabic in Windows Terminal: a right aligned paragraph and a table |
 | `test31_from_utf8lib.ring` | The UTF8Lib functions and the functions that replace them |
 | `test32_shaping_bidi_unit_tests.ring` | Unit tests for shaping, visual order, scripts and utilities |
-
-## Moving from UTF8Lib
-
-The functions of UTF8Lib (`ringutf8.ring`) and the functions of this package that do the same work:
-
-| UTF8Lib | UTF8ProcLib |
-|---------|-------------|
-| `utf8Decode()`, `utf8Encode()`, `utf8Char()` | `unicodeCodepoints()`, `unicodeFromCodepoints()`, `unicodeChar()` |
-| `utf8Len()`, `utf8Sub()`, `utf8Reverse()` | `unicodeLength()` (codepoints) or `unicodeGraphemeCount()` (characters), `unicodeSubStr()`, `unicodeReverse()` |
-| `utf8Code(text, pos)`, `utf8Bytes(cp)` | `unicodeCodepoints(cStr)[nPos]`, `len(unicodeChar(nCode))` |
-| `utf8Valid()` | `unicodeIsValid()` |
-| `utf8IsArabic()`, `utf8IsArabicLetter()`, `utf8IsArabicDiacritic()`, `utf8IsArabicDigit()` | `unicodeIsArabic()` with `unicodeIsLetter()`, `unicodeIsMark()` or `unicodeIsDigit()` |
-| `utf8IsLatin()`, `utf8IsCJK()` | `unicodeScript() = "Latin"`, `unicodeIsCJK()` |
-| `utf8IsDigit()`, `utf8IsSpace()`, `utf8IsRTL()` | `unicodeIsDigit()`, `unicodeIsSpace()`, `unicodeIsRTL()` (all the scripts) |
-| `arabicGetForm()`, `arabicGetJoinType()` | `unicodeArabicForm()`, `unicodeArabicJoiningType()` |
-| `arabicShape()`, `arabicShapeOnly()` | `unicodeArabicShape()` |
-| `bidiReorder()` | `unicodeBidiVisual()` |
-| `arabicProcess()`, `arabicShapeForGame()` | `unicodeArabicVisual()` |
-| `arabicReverse()` | `unicodeReverse()` (keeps the Tashkeel after the letters) |
-| `utf8ToHex()`, `utf8CodepointsToHex()`, `utf8PrintInfo()` | `unicodeToHexBytes()`, `unicodeToHex()`, `? unicodeInfo()` |
 
 ## License
 
