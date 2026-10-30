@@ -111,6 +111,10 @@ func checkValid cStr
 	if len(cVisual) != len(cStr) or utf8proc_length(cVisual) != len(aCodes)
 		nProblems += problem("visual order changed the size", cStr)
 	ok
+	cConsole = utf8proc_avoidligatures(cVisual)
+	if len(cConsole) != len(cVisual) or utf8proc_NFKC(cConsole) != utf8proc_NFKC(cVisual)
+		nProblems += problem("avoid ligatures changed the text", cStr)
+	ok
 	if utf8proc_countranges(cStr, [[0x0590, 0x08FF], [0xFB1D, 0xFDFF], [0xFE70, 0xFEFF], [0x200F, 0x200F], [0x202B, 0x202B], [0x202E, 0x202E], [0x2067, 0x2067]]) = 0 and
 	   utf8proc_bidivisual(cStr, UNICODE_DIRECTION_LTR) != cStr
 		nProblems += problem("visual order changed LTR text", cStr)
@@ -148,7 +152,7 @@ func checkInvalid cStr
 	aFunctions = ["utf8proc_NFC", "utf8proc_NFKC_Casefold", "utf8proc_graphemes", "utf8proc_codepoints",
 		"utf8proc_length", "utf8proc_displaywidth", "utf8proc_upperstring", "utf8proc_words", "utf8proc_graphemecount",
 		"utf8proc_trim", "utf8proc_titlestring", "utf8proc_asciidigits", "unicodeArabicNormalize", "unicodeArabicSearchKey",
-		"utf8proc_arabicshape", "unicodeBidiVisual", "unicodeArabicVisual"]
+		"utf8proc_arabicshape", "unicodeBidiVisual", "unicodeArabicVisual", "unicodeArabicConsole"]
 	nCount = len(aFunctions)
 	for x = 1 to nCount
 		lRaised = False

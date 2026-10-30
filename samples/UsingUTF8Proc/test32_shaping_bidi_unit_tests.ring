@@ -72,6 +72,17 @@ func main
 	check("unicodeArabicVisualWrap", len(unicodeArabicVisualWrap("هذا نص عربي طويل للتجربة", 10)) = 3)
 	check("unicodeArabicVisualWrap lines fit", unicodeWidth(unicodeArabicVisualWrap("هذا نص عربي طويل للتجربة", 10)[1]) <= 10)
 
+	? "Console output (Windows Terminal)"
+	check("Final Alef after a Lam form becomes isolated", unicodeToHex(utf8proc_avoidligatures(unicodeFromCodepoints([0xFEDF, 0xFE8E]))) = "U+FEDF U+FE8D")
+	check("Marks between them are skipped", unicodeToHex(utf8proc_avoidligatures(unicodeFromCodepoints([0xFEE0, 0x64E, 0xFE8E]))) = "U+FEE0 U+064E U+FE8D")
+	check("Alef with Hamza and Madda forms", unicodeToHex(utf8proc_avoidligatures(unicodeFromCodepoints([0xFEDF, 0xFE84, 0xFEDF, 0xFE82]))) = "U+FEDF U+FE83 U+FEDF U+FE81")
+	check("Final Alef after other letters is kept", unicodeToHex(utf8proc_avoidligatures(unicodeFromCodepoints([0xFE91, 0xFE8E]))) = "U+FE91 U+FE8E")
+	check("unicodeArabicConsole of Alef + Lam words", unicodeToHex(unicodeArabicConsole("بالعالم")) = "U+FEE2 U+FEDF U+FE8D U+FECC U+FEDF U+FE8D U+FE91")
+	check("unicodeArabicConsole keeps real Lam-Alef ligatures", unicodeToHex(unicodeArabicConsole("سلام")) = "U+FEE1 U+FEFC U+FEB3")
+	check("unicodeArabicConsole keeps the size", len(unicodeArabicConsole("مرحبا بالعالم")) = len(unicodeArabicVisual("مرحبا بالعالم")))
+	check("unicodeArabicConsoleWrap", len(unicodeArabicConsoleWrap("بالعالم فالكتاب كالقمر", 8)) = 3)
+	check("Avoid ligatures of invalid UTF-8 raises an error", raisesError('utf8proc_avoidligatures("a" + char(0xFF))'))
+
 	? "Scripts and utilities"
 	check("unicodeScript", unicodeScript("a") = "Latin" and unicodeScript("ب") = "Arabic" and unicodeScript("Ж") = "Cyrillic" and
 	      unicodeScript("日") = "Han" and unicodeScript("한") = "Hangul" and unicodeScript("α") = "Greek" and unicodeScript("א") = "Hebrew")
@@ -90,6 +101,8 @@ func main
 	check("arabicVisual", unicodeToHex(oText.arabicVisual().value()) = "U+FEE1 U+FEFC U+FEB3")
 	oText = new UnicodeString("ابت")
 	check("bidiVisual", oText.bidiVisual().value() = "تبا")
+	oConsole = new UnicodeString("بالعالم")
+	check("arabicConsole", unicodeToHex(oConsole.arabicConsole().value()) = "U+FEE2 U+FEDF U+FE8D U+FECC U+FEDF U+FE8D U+FE91")
 	check("info", substr(oText.info(), "Codepoints: 3") > 0)
 
 	? ""

@@ -542,6 +542,7 @@ int utf8proc_arabicjoiningtype(int codepoint)
 int utf8proc_arabicform(int codepoint, int form)
 char *utf8proc_arabicshape(const char *str)
 char *utf8proc_bidivisual(const char *str, int direction)
+char *utf8proc_avoidligatures(const char *str)
 </register>
 
 <code>
@@ -2559,5 +2560,68 @@ RING_FUNC(ring_utf8proc_bidivisual)
 	if ( aClusters != NULL ) {
 		RING_API_FREE(aClusters);
 	}
+}
+/* The presentation forms of Lam (isolated, final, initial, medial) */
+#define RING_UTF8PROC_FIRSTLAMFORM 0xFEDD
+#define RING_UTF8PROC_LASTLAMFORM 0xFEE0
+
+/* The final forms of Alef that some terminal fonts join to a Lam before them, and their isolated forms */
+static const utf8proc_int32_t aRingUTF8ProcAlefFinals[][2] = {
+	{ 0xFE82, 0xFE81 }, { 0xFE84, 0xFE83 }, { 0xFE88, 0xFE87 }, { 0xFE8E, 0xFE8D }, { 0xFB51, 0xFB50 }
+} ;
+
+/*
+**  utf8proc_avoidligatures(cStr): for text in visual order (shaped and reordered)
+**  Some terminals (like Windows Terminal) apply the font Lam-Alef ligature to a Lam form followed by a final Alef form,
+**  but in visual order this sequence is Alef then Lam in the text (like in Arabic "al"): the final Alef after
+**  a Lam form (the marks between them are skipped) is replaced with the isolated Alef, which looks the same in these fonts
+*/
+RING_FUNC(ring_utf8proc_avoidligatures)
+{
+	RingUTF8ProcBuffer oBuffer ;
+	const char *cStr ;
+	utf8proc_ssize_t nSize, nPos, nBytes ;
+	utf8proc_int32_t nCode, nLastLetter ;
+	unsigned int x ;
+	int lOK, lReplaced ;
+	if ( ! ringutf8proc_checkstring(pPointer) ) {
+		return ;
+	}
+	cStr = RING_API_GETSTRING(1);
+	nSize = RING_API_GETSTRINGSIZE(1);
+	if ( ! ringutf8proc_bufferinit(pPointer,&oBuffer,nSize) ) {
+		return ;
+	}
+	nPos = 0 ;
+	nLastLetter = 0 ;
+	lOK = 1 ;
+	while ( lOK && ((nBytes = ringutf8proc_next(cStr,nSize,nPos,&nCode)) > 0) ) {
+		lReplaced = 0 ;
+		if ( (nLastLetter >= RING_UTF8PROC_FIRSTLAMFORM) && (nLastLetter <= RING_UTF8PROC_LASTLAMFORM) ) {
+			for ( x = 0 ; x < sizeof(aRingUTF8ProcAlefFinals) / sizeof(aRingUTF8ProcAlefFinals[0]) ; x++ ) {
+				if ( aRingUTF8ProcAlefFinals[x][0] == nCode ) {
+					lOK = ringutf8proc_bufferaddcode(pPointer,&oBuffer,aRingUTF8ProcAlefFinals[x][1]);
+					lReplaced = 1 ;
+					break ;
+				}
+			}
+		}
+		if ( ! lReplaced ) {
+			lOK = ringutf8proc_bufferadd(pPointer,&oBuffer,cStr + nPos,nBytes);
+		}
+		if ( utf8proc_category(nCode) != UTF8PROC_CATEGORY_MN ) {
+			nLastLetter = nCode ;
+		}
+		nPos += nBytes ;
+	}
+	if ( ! lOK ) {
+		return ;
+	}
+	if ( nBytes < 0 ) {
+		RING_API_FREE(oBuffer.pData);
+		ringutf8proc_error(pPointer,nBytes);
+		return ;
+	}
+	ringutf8proc_bufferreturn(pPointer,&oBuffer);
 }
 </code>

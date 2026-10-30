@@ -31,7 +31,7 @@ func main
 	showRow("arabicShapeOnly(text)", "unicodeArabicShape(cStr)", unicodeToHex(unicodeArabicShape("لا")))
 	showRow("bidiReorder(text)", "unicodeBidiVisual(cStr)", unicodeToHex(unicodeBidiVisual("ab بت")))
 	showRow("arabicReverse(text)", "unicodeReverse(cStr) (keeps the marks after the letters)", unicodeToHex(unicodeReverse("بَت")))
-	showRow("arabicProcess(text)", "unicodeArabicVisual(cStr)", unicodeToHex(unicodeArabicVisual("سلام")))
+	showRow("arabicProcess(text)", "unicodeArabicConsole(cStr) (terminals)", unicodeToHex(unicodeArabicConsole("سلام")))
 	showRow("arabicShapeForGame(text)", "unicodeArabicVisual(cStr)", unicodeToHex(unicodeArabicVisual("سلام")))
 	showRow("utf8ToHex(text)", "unicodeToHexBytes(cStr)", unicodeToHexBytes("€"))
 	showRow("utf8CodepointsToHex(codepoints)", "unicodeToHex(cStr)", unicodeToHex("€"))

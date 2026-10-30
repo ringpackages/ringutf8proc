@@ -425,6 +425,19 @@ func unicodeArabicVisualWrap cStr, nWidth
 	next
 	return aLines
 
+func unicodeArabicConsole cStr
+	# For terminals that join the letters but don't reorder right-to-left text (like Windows Terminal):
+	# visual order, without the false Lam-Alef ligatures these terminals make from Alef + Lam (like in "al")
+	return utf8proc_avoidligatures(unicodeArabicVisual(cStr))
+
+func unicodeArabicConsoleWrap cStr, nWidth
+	aLines = unicodeArabicVisualWrap(cStr, nWidth)
+	nCount = len(aLines)
+	for x = 1 to nCount
+		aLines[x] = utf8proc_avoidligatures(aLines[x])
+	next
+	return aLines
+
 # Codepoints
 
 func unicodeCodepoints cStr

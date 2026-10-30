@@ -158,7 +158,7 @@ Arabic text can be written in different ways that readers consider the same: wit
 | `unicodeHasArabic(cStr)`, `unicodeArabicCharCount(cStr)` | Find and count the Arabic codepoints |
 | `unicodeArabicTashkeelPairs()` | The table used to remove Tashkeel (built from the Unicode data: the nonspacing marks of the Arabic blocks) |
 
-Terminals that support bidirectional text (like GNOME Terminal and Konsole) show Arabic right to left. Windows Terminal joins the letters but shows them left to right, so text printed in logical order looks reversed there: use `unicodeArabicVisual()` (see the next section) to print it. The library keeps text in logical order (the order of reading), which is the order to store and process text.
+Terminals that support bidirectional text (like GNOME Terminal and Konsole) show Arabic right to left. Windows Terminal joins the letters but shows them left to right, so text printed in logical order looks reversed there: use `unicodeArabicConsole()` (see the next section) to print it. The library keeps text in logical order (the order of reading), which is the order to store and process text.
 
 ### Arabic Shaping and Visual Order
 
@@ -166,7 +166,9 @@ Text is stored and processed in logical order (the order of reading). Some rende
 
 | Function | Description |
 |----------|-------------|
-| `unicodeArabicVisual(cStr)` | Shape, then reorder: ready to print in Windows Terminal or to draw using a game engine |
+| `unicodeArabicConsole(cStr)` | For Windows Terminal: shape, reorder, and avoid the false Lam-Alef ligatures that it draws for Alef followed by Lam (like in `"بالعالم"`) |
+| `unicodeArabicConsoleWrap(cStr, nWidth)` | Wrap, then prepare each line for Windows Terminal (print the lines aligned to the right using `unicodePadLeft()`) |
+| `unicodeArabicVisual(cStr)` | Shape, then reorder: ready to draw using a game engine |
 | `unicodeArabicVisualWrap(cStr, nWidth)` | Wrap in logical order, then shape and reorder each line (draw the lines from top to bottom, aligned to the right) |
 | `unicodeArabicShape(cStr)` | Presentation forms (isolated, initial, medial, final) and Lam-Alef ligatures, without reordering (for renderers that reorder but don't shape) |
 | `unicodeBidiVisual(cStr)` | Reorder each line to visual order; the direction of a line comes from its first strong character |
@@ -178,6 +180,8 @@ Text is stored and processed in logical order (the order of reading). Some rende
 The visual order uses the rules of the Unicode Bidirectional Algorithm (UAX 9) for numbers, separators, neutrals and mirrored brackets, so `"السعر 120 ريال"` and `"Ring لغة 2026"` are ordered like in browsers. A letter stays before its Tashkeel, and emoji sequences stay together. The explicit embedding and isolate characters (LRE, RLI, ...) are not supported.
 
 The presentation forms table is built from the Unicode data (the `<isolated>`, `<final>`, `<initial>` and `<medial>` decompositions), so the Persian and Urdu letters (`پ چ ژ گ ک ی`) are shaped too.
+
+Windows Terminal joins adjacent presentation forms of Lam and final Alef into a Lam-Alef ligature. In visual order this happens for Alef followed by Lam (`"ال"`), which is not a ligature, so `unicodeArabicConsole()` uses the isolated Alef form there (it looks the same in terminal fonts). The output of `test30_arabic_terminal.ring` was checked in Windows Terminal.
 
 ### Digits
 
@@ -283,7 +287,7 @@ Create it using `new UnicodeString(cText)` (or `new UnicodeString` for an empty 
 | `trimSpaces()`, `replaceText(cOld, cNew)` | Trim and replace (return self) |
 | `hasArabic()`, `info()` | True if the text contains Arabic; the description from `unicodeInfo()` |
 | `arabicNormalize()`, `arabicStripTashkeel()`, `toArabicDigits()`, `toAsciiDigits()` | Arabic text and digits (return self) |
-| `arabicShape()`, `arabicVisual()`, `bidiVisual()` | Shaping and visual order (return self) |
+| `arabicShape()`, `arabicVisual()`, `arabicConsole()`, `bidiVisual()` | Shaping and visual order (return self) |
 | `toNFC()`, `toNFD()`, `toNFKC()`, `toNFKD()` | Normalization (return self) |
 | `toUpper()`, `toLower()`, `toTitle()`, `toCaseFold()` | Case (return self) |
 | `toReversed()`, `toSlug()`, `stripMarks()`, `stripControls()`, `fixInvalid()` | Transformations (return self) |

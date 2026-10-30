@@ -173,6 +173,10 @@ class UnicodeString
 		cText = unicodeArabicVisual(cText)
 		return self
 
+	func arabicConsole
+		cText = unicodeArabicConsole(cText)
+		return self
+
 	func bidiVisual
 		cText = unicodeBidiVisual(cText)
 		return self

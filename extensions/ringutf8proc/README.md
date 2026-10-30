@@ -105,6 +105,7 @@ The codepoint parameters are checked: a number outside the range 0 to 0x10FFFF r
 | `utf8proc_arabicjoiningtype(nCode)` | `RING_UTF8PROC_JOINNONE`, `JOINRIGHT`, `JOINDUAL`, `JOINCAUSING` (Tatweel, ZWJ) or `JOINTRANSPARENT` (marks) |
 | `utf8proc_arabicform(nCode, nForm)` | The presentation form (`RING_UTF8PROC_FORMISOLATED`, `FORMFINAL`, `FORMINITIAL`, `FORMMEDIAL`) of a letter, or 0 |
 | `utf8proc_bidivisual(cStr, nDirection)` | Reorder each line from logical to visual order (`RING_UTF8PROC_DIRECTIONAUTO`, `DIRECTIONLTR`, `DIRECTIONRTL`) using the rules W1-W7, N1, N2, I1, I2, L1, L2 and L4 of the Unicode Bidirectional Algorithm (UAX 9); grapheme clusters stay together and brackets are mirrored; explicit embeddings and isolates are not supported |
+| `utf8proc_avoidligatures(cStr)` | For text in visual order printed in terminals that apply font ligatures (like Windows Terminal): a final Alef form after a Lam form (in visual order this is Alef then Lam in the text, like in "al") becomes the isolated Alef form, so the terminal doesn't draw a false Lam-Alef ligature |
 | `utf8proc_codepoints(cStr)` | List of codepoints |
 | `utf8proc_fromcodepoints(aCodes)` | UTF-8 string of a list of codepoints |
 | `utf8proc_graphemes(cStr)` | List of grapheme clusters (UAX #29) |
