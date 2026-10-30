@@ -1,0 +1,2563 @@
+<code>
+/*
+**  RingUTF8Proc - utf8proc Extension for the Ring Programming Language
+**  Unicode normalization, case mapping, grapheme clusters and character properties
+*/
+
+/* The build scripts define UTF8PROC_STATIC (utf8proc is compiled into the extension) */
+#include "utf8proc/utf8proc.h"
+
+/* Largest valid Unicode codepoint */
+#define RING_UTF8PROC_MAXCODEPOINT 0x10FFFF
+
+/* Size of the buffer used by utf8proc_decompose_char() */
+#define RING_UTF8PROC_DECOMPOSESIZE 64
+
+/* Maximum bytes of one encoded codepoint */
+#define RING_UTF8PROC_MAXCHARBYTES 4
+
+/* Largest input (in bytes) that functions which allocate RING_UTF8PROC_MAXCHARBYTES per byte accept */
+#define RING_UTF8PROC_MAXINPUT ((utf8proc_ssize_t) (INT_MAX / RING_UTF8PROC_MAXCHARBYTES) - 1)
+
+/* The replacement character U+FFFD in UTF-8 */
+#define RING_UTF8PROC_REPLACEMENT "\xEF\xBF\xBD"
+#define RING_UTF8PROC_REPLACEMENTSIZE 3
+
+/* Codepoints used to compute the display width of grapheme clusters */
+#define RING_UTF8PROC_EMOJIPRESENTATION 0xFE0F
+#define RING_UTF8PROC_FIRSTREGIONAL 0x1F1E6
+#define RING_UTF8PROC_LASTREGIONAL 0x1F1FF
+#define RING_UTF8PROC_WIDEWIDTH 2
+
+/* Arabic presentation forms (the form numbers used by utf8proc_arabicform()) */
+#define RING_UTF8PROC_FORMISOLATED 1
+#define RING_UTF8PROC_FORMFINAL 2
+#define RING_UTF8PROC_FORMINITIAL 3
+#define RING_UTF8PROC_FORMMEDIAL 4
+
+/* Arabic joining types (returned by utf8proc_arabicjoiningtype()) */
+#define RING_UTF8PROC_JOINNONE 0
+#define RING_UTF8PROC_JOINRIGHT 1
+#define RING_UTF8PROC_JOINDUAL 2
+#define RING_UTF8PROC_JOINCAUSING 3
+#define RING_UTF8PROC_JOINTRANSPARENT 4
+
+/* Paragraph directions used by utf8proc_bidivisual() */
+#define RING_UTF8PROC_DIRECTIONAUTO 0
+#define RING_UTF8PROC_DIRECTIONLTR 1
+#define RING_UTF8PROC_DIRECTIONRTL 2
+
+/* Apostrophes that can join the parts of a word (like don't) */
+#define RING_UTF8PROC_APOSTROPHE 0x27
+#define RING_UTF8PROC_RIGHTQUOTE 0x2019
+
+/* Prefix of the errors raised by the extension */
+#define RING_UTF8PROC_ERRORPREFIX "utf8proc Error: "
+
+/* Size of the buffer used to build error messages */
+#define RING_UTF8PROC_ERRORSIZE 256
+
+/* Raise a Ring error that contains the utf8proc error message */
+static void ringutf8proc_error ( void *pPointer, utf8proc_ssize_t nError )
+{
+	char cError[RING_UTF8PROC_ERRORSIZE] ;
+	snprintf(cError,RING_UTF8PROC_ERRORSIZE,"%s%s",RING_UTF8PROC_ERRORPREFIX,utf8proc_errmsg(nError));
+	RING_API_ERROR(cError);
+}
+
+/* Check that the parameter is a number inside the codepoint range */
+static int ringutf8proc_iscodepoint ( void *pPointer, int nPara )
+{
+	double nValue ;
+	if ( ! RING_API_ISNUMBER(nPara) ) {
+		return 0 ;
+	}
+	nValue = RING_API_GETNUMBER(nPara);
+	return (nValue >= 0) && (nValue <= RING_UTF8PROC_MAXCODEPOINT) ;
+}
+
+/* Check that the function received one string parameter */
+static int ringutf8proc_checkstring ( void *pPointer )
+{
+	if ( RING_API_PARACOUNT != 1 ) {
+		RING_API_ERROR(RING_API_MISS1PARA);
+		return 0 ;
+	}
+	if ( ! RING_API_ISSTRING(1) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return 0 ;
+	}
+	return 1 ;
+}
+
+/*
+**  Read the codepoint that starts at byte nPos
+**  Returns the number of bytes read (0 at the end of the string) or a negative error code
+*/
+static utf8proc_ssize_t ringutf8proc_next ( const char *cStr, utf8proc_ssize_t nSize, utf8proc_ssize_t nPos, utf8proc_int32_t *pCode )
+{
+	*pCode = -1 ;
+	if ( nPos >= nSize ) {
+		return 0 ;
+	}
+	return utf8proc_iterate((const utf8proc_uint8_t *) cStr + nPos,nSize - nPos,pCode) ;
+}
+
+/*
+**  Map the string with utf8proc_map() and return the result
+**  The input length is used, so strings that contain char(0) are processed
+*/
+static void ringutf8proc_retmap ( void *pPointer, const char *cStr, utf8proc_ssize_t nSize, unsigned int nOptions )
+{
+	utf8proc_uint8_t *pOutput ;
+	utf8proc_ssize_t nResult ;
+	pOutput = NULL ;
+	nResult = utf8proc_map((const utf8proc_uint8_t *) cStr,nSize,&pOutput,nOptions);
+	if ( nResult < 0 ) {
+		ringutf8proc_error(pPointer,nResult);
+		return ;
+	}
+	RING_API_RETSTRING2((const char *) pOutput,(unsigned int) nResult);
+	utf8proc_free(pOutput);
+}
+
+/* Map the string parameter using the given options */
+static void ringutf8proc_mapparameter ( void *pPointer, unsigned int nOptions )
+{
+	if ( ! ringutf8proc_checkstring(pPointer) ) {
+		return ;
+	}
+	ringutf8proc_retmap(pPointer,RING_API_GETSTRING(1),RING_API_GETSTRINGSIZE(1),nOptions);
+}
+
+/*
+**  Read the codepoint parameter (the only parameter of the function)
+**  Raises an error for a missing parameter, a parameter that is not a number,
+**  or a number outside the range 0 to 0x10FFFF
+*/
+static int ringutf8proc_getcodeparameter ( void *pPointer, utf8proc_int32_t *pCode )
+{
+	if ( RING_API_PARACOUNT != 1 ) {
+		RING_API_ERROR(RING_API_MISS1PARA);
+		return 0 ;
+	}
+	if ( ! RING_API_ISNUMBER(1) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return 0 ;
+	}
+	if ( ! ringutf8proc_iscodepoint(pPointer,1) ) {
+		RING_API_ERROR(RING_API_BADPARARANGE);
+		return 0 ;
+	}
+	*pCode = (utf8proc_int32_t) RING_API_GETNUMBER(1);
+	return 1 ;
+}
+
+/* Check that the output buffer of RING_UTF8PROC_MAXCHARBYTES per input byte can be allocated */
+static int ringutf8proc_checksize ( void *pPointer, utf8proc_ssize_t nSize )
+{
+	if ( nSize > RING_UTF8PROC_MAXINPUT ) {
+		ringutf8proc_error(pPointer,UTF8PROC_ERROR_OVERFLOW);
+		return 0 ;
+	}
+	return 1 ;
+}
+
+/* Return true if the codepoint is a letter, a mark or a number (part of a word) */
+static int ringutf8proc_iswordchar ( utf8proc_int32_t nCode )
+{
+	utf8proc_category_t nCategory ;
+	nCategory = utf8proc_category(nCode);
+	return (nCategory >= UTF8PROC_CATEGORY_LU) && (nCategory <= UTF8PROC_CATEGORY_NO) ;
+}
+
+/* Return true for the apostrophes that can join the parts of a word (like don't) */
+static int ringutf8proc_isapostrophe ( utf8proc_int32_t nCode )
+{
+	return (nCode == RING_UTF8PROC_APOSTROPHE) || (nCode == RING_UTF8PROC_RIGHTQUOTE) ;
+}
+
+/* Iterator over the grapheme clusters (UAX 29) of a string */
+typedef struct RingUTF8ProcGraphemes {
+	const char *cStr ;
+	utf8proc_ssize_t nSize ;
+	/* Position and size of the next codepoint (read ahead) */
+	utf8proc_ssize_t nPos ;
+	utf8proc_ssize_t nBytes ;
+	utf8proc_int32_t nCode ;
+	/* State of utf8proc_grapheme_break_stateful() */
+	utf8proc_int32_t nState ;
+} RingUTF8ProcGraphemes ;
+
+static void ringutf8proc_graphemesinit ( RingUTF8ProcGraphemes *pIter, const char *cStr, utf8proc_ssize_t nSize )
+{
+	pIter->cStr = cStr ;
+	pIter->nSize = nSize ;
+	pIter->nPos = 0 ;
+	pIter->nState = 0 ;
+	pIter->nBytes = ringutf8proc_next(cStr,nSize,0,&pIter->nCode);
+}
+
+/*
+**  Find the next grapheme cluster: the bytes from *pStart to *pEnd (not included)
+**  Returns 1 if a cluster is found, 0 at the end of the string, or a negative error code
+*/
+static utf8proc_ssize_t ringutf8proc_graphemesnext ( RingUTF8ProcGraphemes *pIter, utf8proc_ssize_t *pStart, utf8proc_ssize_t *pEnd )
+{
+	utf8proc_int32_t nPrevCode ;
+	if ( pIter->nBytes <= 0 ) {
+		return pIter->nBytes ;
+	}
+	*pStart = pIter->nPos ;
+	while ( 1 ) {
+		nPrevCode = pIter->nCode ;
+		pIter->nPos += pIter->nBytes ;
+		pIter->nBytes = ringutf8proc_next(pIter->cStr,pIter->nSize,pIter->nPos,&pIter->nCode);
+		if ( pIter->nBytes < 0 ) {
+			return pIter->nBytes ;
+		}
+		if ( (pIter->nBytes == 0) || utf8proc_grapheme_break_stateful(nPrevCode,pIter->nCode,&pIter->nState) ) {
+			break ;
+		}
+	}
+	*pEnd = pIter->nPos ;
+	return 1 ;
+}
+
+/*
+**  Display width (terminal columns) of the grapheme cluster cStr[nStart..nEnd)
+**  The cluster takes the width of its widest codepoint (emoji sequences use 2 columns, not the sum)
+**  An emoji presentation selector (U+FE0F) and a flag (two regional indicators) use 2 columns
+*/
+static int ringutf8proc_graphemewidth ( const char *cStr, utf8proc_ssize_t nStart, utf8proc_ssize_t nEnd )
+{
+	utf8proc_ssize_t nBytes ;
+	utf8proc_int32_t nCode ;
+	int nWidth, nCharWidth, nRegional ;
+	nWidth = 0 ;
+	nRegional = 0 ;
+	while ( (nBytes = ringutf8proc_next(cStr,nEnd,nStart,&nCode)) > 0 ) {
+		nStart += nBytes ;
+		if ( (nCode == RING_UTF8PROC_EMOJIPRESENTATION) ||
+		     ((nCode >= RING_UTF8PROC_FIRSTREGIONAL) && (nCode <= RING_UTF8PROC_LASTREGIONAL) && (++nRegional == 2)) ) {
+			nCharWidth = RING_UTF8PROC_WIDEWIDTH ;
+		}
+		else {
+			nCharWidth = utf8proc_charwidth(nCode);
+		}
+		if ( nCharWidth > nWidth ) {
+			nWidth = nCharWidth ;
+		}
+	}
+	return nWidth ;
+}
+
+/* Return true if the grapheme cluster cStr[nStart..nEnd) starts with a space separator */
+static int ringutf8proc_graphemeisspace ( const char *cStr, utf8proc_ssize_t nStart, utf8proc_ssize_t nEnd )
+{
+	utf8proc_int32_t nCode ;
+	utf8proc_ssize_t nBytes ;
+	nBytes = ringutf8proc_next(cStr,nEnd,nStart,&nCode);
+	/* A space followed by a combining character (one cluster) is not a space */
+	return (nStart + nBytes == nEnd) && (utf8proc_category(nCode) == UTF8PROC_CATEGORY_ZS) ;
+}
+
+/* Category of the first codepoint of the grapheme cluster cStr[nStart..nEnd) */
+static utf8proc_category_t ringutf8proc_graphemecategory ( const char *cStr, utf8proc_ssize_t nStart, utf8proc_ssize_t nEnd )
+{
+	utf8proc_int32_t nCode ;
+	ringutf8proc_next(cStr,nEnd,nStart,&nCode);
+	return utf8proc_category(nCode) ;
+}
+
+/* Return true for punctuation that should not start a line (closing brackets and quotes, full stops, commas) */
+static int ringutf8proc_isclosingpunct ( utf8proc_category_t nCategory )
+{
+	return (nCategory == UTF8PROC_CATEGORY_PE) || (nCategory == UTF8PROC_CATEGORY_PF) || (nCategory == UTF8PROC_CATEGORY_PO) ;
+}
+
+/* Return true if the grapheme cluster that starts at cStr[nStart] is a line break (LF, CR or CR LF) */
+static int ringutf8proc_graphemeisnewline ( const char *cStr, utf8proc_ssize_t nStart )
+{
+	return (cStr[nStart] == '\n') || (cStr[nStart] == '\r') ;
+}
+
+/* Case conversion modes used by ringutf8proc_convertcase() */
+#define RING_UTF8PROC_CASELOWER 1
+#define RING_UTF8PROC_CASEUPPER 2
+#define RING_UTF8PROC_CASETITLE 3
+
+/* Convert the case of each codepoint in the string parameter (simple one to one case mapping) */
+static void ringutf8proc_convertcase ( void *pPointer, int nMode )
+{
+	const char *cStr ;
+	utf8proc_uint8_t *pOutput ;
+	utf8proc_ssize_t nSize, nPos, nBytes, nOutSize ;
+	utf8proc_int32_t nCode ;
+	int lWordStart ;
+	if ( ! ringutf8proc_checkstring(pPointer) ) {
+		return ;
+	}
+	cStr = RING_API_GETSTRING(1);
+	nSize = RING_API_GETSTRINGSIZE(1);
+	if ( ! ringutf8proc_checksize(pPointer,nSize) ) {
+		return ;
+	}
+	pOutput = (utf8proc_uint8_t *) RING_API_MALLOC(nSize * RING_UTF8PROC_MAXCHARBYTES + 1);
+	if ( pOutput == NULL ) {
+		ringutf8proc_error(pPointer,UTF8PROC_ERROR_NOMEM);
+		return ;
+	}
+	nPos = 0 ;
+	nOutSize = 0 ;
+	lWordStart = 1 ;
+	while ( (nBytes = ringutf8proc_next(cStr,nSize,nPos,&nCode)) > 0 ) {
+		nPos += nBytes ;
+		if ( nMode == RING_UTF8PROC_CASELOWER ) {
+			nCode = utf8proc_tolower(nCode);
+		}
+		else if ( nMode == RING_UTF8PROC_CASEUPPER ) {
+			nCode = utf8proc_toupper(nCode);
+		}
+		else if ( ringutf8proc_iswordchar(nCode) ) {
+			nCode = lWordStart ? utf8proc_totitle(nCode) : utf8proc_tolower(nCode) ;
+			lWordStart = 0 ;
+		}
+		else if ( ! ( ringutf8proc_isapostrophe(nCode) && ! lWordStart ) ) {
+			/* An apostrophe inside a word (like don't) doesn't start a new word */
+			lWordStart = 1 ;
+		}
+		nOutSize += utf8proc_encode_char(nCode,pOutput + nOutSize);
+	}
+	if ( nBytes < 0 ) {
+		RING_API_FREE(pOutput);
+		ringutf8proc_error(pPointer,nBytes);
+		return ;
+	}
+	RING_API_RETSTRING2((const char *) pOutput,(unsigned int) nOutSize);
+	RING_API_FREE(pOutput);
+}
+</code>
+
+<runcode>
+aNumberTypes + "utf8proc_int32_t"
+aNumberTypes + "utf8proc_ssize_t"
+aNumberTypes + "utf8proc_bool"
+aNumberTypes + "utf8proc_category_t"
+</runcode>
+
+<constant>
+UTF8PROC_VERSION_MAJOR
+UTF8PROC_VERSION_MINOR
+UTF8PROC_VERSION_PATCH
+UTF8PROC_NULLTERM
+UTF8PROC_STABLE
+UTF8PROC_COMPAT
+UTF8PROC_COMPOSE
+UTF8PROC_DECOMPOSE
+UTF8PROC_IGNORE
+UTF8PROC_REJECTNA
+UTF8PROC_NLF2LS
+UTF8PROC_NLF2PS
+UTF8PROC_NLF2LF
+UTF8PROC_STRIPCC
+UTF8PROC_CASEFOLD
+UTF8PROC_CHARBOUND
+UTF8PROC_LUMP
+UTF8PROC_STRIPMARK
+UTF8PROC_STRIPNA
+UTF8PROC_ERROR_NOMEM
+UTF8PROC_ERROR_OVERFLOW
+UTF8PROC_ERROR_INVALIDUTF8
+UTF8PROC_ERROR_NOTASSIGNED
+UTF8PROC_ERROR_INVALIDOPTS
+UTF8PROC_CATEGORY_CN
+UTF8PROC_CATEGORY_LU
+UTF8PROC_CATEGORY_LL
+UTF8PROC_CATEGORY_LT
+UTF8PROC_CATEGORY_LM
+UTF8PROC_CATEGORY_LO
+UTF8PROC_CATEGORY_MN
+UTF8PROC_CATEGORY_MC
+UTF8PROC_CATEGORY_ME
+UTF8PROC_CATEGORY_ND
+UTF8PROC_CATEGORY_NL
+UTF8PROC_CATEGORY_NO
+UTF8PROC_CATEGORY_PC
+UTF8PROC_CATEGORY_PD
+UTF8PROC_CATEGORY_PS
+UTF8PROC_CATEGORY_PE
+UTF8PROC_CATEGORY_PI
+UTF8PROC_CATEGORY_PF
+UTF8PROC_CATEGORY_PO
+UTF8PROC_CATEGORY_SM
+UTF8PROC_CATEGORY_SC
+UTF8PROC_CATEGORY_SK
+UTF8PROC_CATEGORY_SO
+UTF8PROC_CATEGORY_ZS
+UTF8PROC_CATEGORY_ZL
+UTF8PROC_CATEGORY_ZP
+UTF8PROC_CATEGORY_CC
+UTF8PROC_CATEGORY_CF
+UTF8PROC_CATEGORY_CS
+UTF8PROC_CATEGORY_CO
+UTF8PROC_BIDI_CLASS_L
+UTF8PROC_BIDI_CLASS_LRE
+UTF8PROC_BIDI_CLASS_LRO
+UTF8PROC_BIDI_CLASS_R
+UTF8PROC_BIDI_CLASS_AL
+UTF8PROC_BIDI_CLASS_RLE
+UTF8PROC_BIDI_CLASS_RLO
+UTF8PROC_BIDI_CLASS_PDF
+UTF8PROC_BIDI_CLASS_EN
+UTF8PROC_BIDI_CLASS_ES
+UTF8PROC_BIDI_CLASS_ET
+UTF8PROC_BIDI_CLASS_AN
+UTF8PROC_BIDI_CLASS_CS
+UTF8PROC_BIDI_CLASS_NSM
+UTF8PROC_BIDI_CLASS_BN
+UTF8PROC_BIDI_CLASS_B
+UTF8PROC_BIDI_CLASS_S
+UTF8PROC_BIDI_CLASS_WS
+UTF8PROC_BIDI_CLASS_ON
+UTF8PROC_BIDI_CLASS_LRI
+UTF8PROC_BIDI_CLASS_RLI
+UTF8PROC_BIDI_CLASS_FSI
+UTF8PROC_BIDI_CLASS_PDI
+UTF8PROC_DECOMP_TYPE_FONT
+UTF8PROC_DECOMP_TYPE_NOBREAK
+UTF8PROC_DECOMP_TYPE_INITIAL
+UTF8PROC_DECOMP_TYPE_MEDIAL
+UTF8PROC_DECOMP_TYPE_FINAL
+UTF8PROC_DECOMP_TYPE_ISOLATED
+UTF8PROC_DECOMP_TYPE_CIRCLE
+UTF8PROC_DECOMP_TYPE_SUPER
+UTF8PROC_DECOMP_TYPE_SUB
+UTF8PROC_DECOMP_TYPE_VERTICAL
+UTF8PROC_DECOMP_TYPE_WIDE
+UTF8PROC_DECOMP_TYPE_NARROW
+UTF8PROC_DECOMP_TYPE_SMALL
+UTF8PROC_DECOMP_TYPE_SQUARE
+UTF8PROC_DECOMP_TYPE_FRACTION
+UTF8PROC_DECOMP_TYPE_COMPAT
+UTF8PROC_BOUNDCLASS_START
+UTF8PROC_BOUNDCLASS_OTHER
+UTF8PROC_BOUNDCLASS_CR
+UTF8PROC_BOUNDCLASS_LF
+UTF8PROC_BOUNDCLASS_CONTROL
+UTF8PROC_BOUNDCLASS_EXTEND
+UTF8PROC_BOUNDCLASS_L
+UTF8PROC_BOUNDCLASS_V
+UTF8PROC_BOUNDCLASS_T
+UTF8PROC_BOUNDCLASS_LV
+UTF8PROC_BOUNDCLASS_LVT
+UTF8PROC_BOUNDCLASS_REGIONAL_INDICATOR
+UTF8PROC_BOUNDCLASS_SPACINGMARK
+UTF8PROC_BOUNDCLASS_PREPEND
+UTF8PROC_BOUNDCLASS_ZWJ
+UTF8PROC_BOUNDCLASS_E_BASE
+UTF8PROC_BOUNDCLASS_E_MODIFIER
+UTF8PROC_BOUNDCLASS_GLUE_AFTER_ZWJ
+UTF8PROC_BOUNDCLASS_E_BASE_GAZ
+UTF8PROC_BOUNDCLASS_EXTENDED_PICTOGRAPHIC
+UTF8PROC_BOUNDCLASS_E_ZWG
+UTF8PROC_INDIC_CONJUNCT_BREAK_NONE
+UTF8PROC_INDIC_CONJUNCT_BREAK_LINKER
+UTF8PROC_INDIC_CONJUNCT_BREAK_CONSONANT
+UTF8PROC_INDIC_CONJUNCT_BREAK_EXTEND
+RING_UTF8PROC_FORMISOLATED
+RING_UTF8PROC_FORMFINAL
+RING_UTF8PROC_FORMINITIAL
+RING_UTF8PROC_FORMMEDIAL
+RING_UTF8PROC_JOINNONE
+RING_UTF8PROC_JOINRIGHT
+RING_UTF8PROC_JOINDUAL
+RING_UTF8PROC_JOINCAUSING
+RING_UTF8PROC_JOINTRANSPARENT
+RING_UTF8PROC_DIRECTIONAUTO
+RING_UTF8PROC_DIRECTIONLTR
+RING_UTF8PROC_DIRECTIONRTL
+</constant>
+
+<comment>
+Library Information
+</comment>
+
+const char *utf8proc_version(void)
+const char *utf8proc_unicode_version(void)
+const char *utf8proc_errmsg(utf8proc_ssize_t errcode)
+
+<comment>
+Custom Functions (implemented below)
+</comment>
+
+<register>
+int utf8proc_codepoint_valid(int codepoint)
+int utf8proc_tolower(int c)
+int utf8proc_toupper(int c)
+int utf8proc_totitle(int c)
+int utf8proc_islower(int c)
+int utf8proc_isupper(int c)
+int utf8proc_charwidth(int codepoint)
+int utf8proc_charwidth_ambiguous(int codepoint)
+int utf8proc_category(int codepoint)
+const char *utf8proc_category_string(int codepoint)
+int utf8proc_grapheme_break(int codepoint1, int codepoint2)
+char *utf8proc_map(const char *str, unsigned int options)
+char *utf8proc_NFD(const char *str)
+char *utf8proc_NFC(const char *str)
+char *utf8proc_NFKD(const char *str)
+char *utf8proc_NFKC(const char *str)
+char *utf8proc_NFKC_Casefold(const char *str)
+char *utf8proc_encode_char(int codepoint)
+List *utf8proc_iterate(const char *str, int pos)
+List *utf8proc_get_property(int codepoint)
+List *utf8proc_decompose_char(int codepoint, unsigned int options)
+List *utf8proc_grapheme_break_stateful(int codepoint1, int codepoint2, int state)
+int utf8proc_isvalid(const char *str)
+int utf8proc_length(const char *str)
+int utf8proc_strwidth(const char *str)
+List *utf8proc_codepoints(const char *str)
+char *utf8proc_fromcodepoints(List *codepoints)
+List *utf8proc_graphemes(const char *str)
+int utf8proc_graphemecount(const char *str)
+char *utf8proc_lowerstring(const char *str)
+char *utf8proc_upperstring(const char *str)
+char *utf8proc_titlestring(const char *str)
+int utf8proc_displaywidth(const char *str)
+char *utf8proc_truncatewidth(const char *str, int width)
+List *utf8proc_wrap(const char *str, int width)
+List *utf8proc_words(const char *str)
+char *utf8proc_replaceinvalid(const char *str)
+char *utf8proc_trim(const char *str)
+char *utf8proc_trimleft(const char *str)
+char *utf8proc_trimright(const char *str)
+int utf8proc_find(const char *str, const char *substr)
+char *utf8proc_replace(const char *str, const char *oldstr, const char *newstr)
+char *utf8proc_mapchars(const char *str, List *pairs)
+int utf8proc_digitvalue(int codepoint)
+char *utf8proc_asciidigits(const char *str)
+int utf8proc_countranges(const char *str, List *ranges)
+int utf8proc_arabicjoiningtype(int codepoint)
+int utf8proc_arabicform(int codepoint, int form)
+char *utf8proc_arabicshape(const char *str)
+char *utf8proc_bidivisual(const char *str, int direction)
+</register>
+
+<code>
+
+/* ========================================================================== */
+/*  Custom Ring Function Implementations                                      */
+/* ========================================================================== */
+
+/*
+**  Codepoint functions
+**  The codepoint is checked before the cast (casting a huge double to an integer is undefined)
+*/
+
+/* --- utf8proc_codepoint_valid(nCode): numbers outside the codepoint range return false --- */
+RING_FUNC(ring_utf8proc_codepoint_valid)
+{
+	if ( RING_API_PARACOUNT != 1 ) {
+		RING_API_ERROR(RING_API_MISS1PARA);
+		return ;
+	}
+	if ( ! RING_API_ISNUMBER(1) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return ;
+	}
+	RING_API_RETNUMBER(ringutf8proc_iscodepoint(pPointer,1) && utf8proc_codepoint_valid((utf8proc_int32_t) RING_API_GETNUMBER(1)));
+}
+
+RING_FUNC(ring_utf8proc_tolower)
+{
+	utf8proc_int32_t nCode ;
+	if ( ringutf8proc_getcodeparameter(pPointer,&nCode) ) {
+		RING_API_RETNUMBER(utf8proc_tolower(nCode));
+	}
+}
+
+RING_FUNC(ring_utf8proc_toupper)
+{
+	utf8proc_int32_t nCode ;
+	if ( ringutf8proc_getcodeparameter(pPointer,&nCode) ) {
+		RING_API_RETNUMBER(utf8proc_toupper(nCode));
+	}
+}
+
+RING_FUNC(ring_utf8proc_totitle)
+{
+	utf8proc_int32_t nCode ;
+	if ( ringutf8proc_getcodeparameter(pPointer,&nCode) ) {
+		RING_API_RETNUMBER(utf8proc_totitle(nCode));
+	}
+}
+
+RING_FUNC(ring_utf8proc_islower)
+{
+	utf8proc_int32_t nCode ;
+	if ( ringutf8proc_getcodeparameter(pPointer,&nCode) ) {
+		RING_API_RETNUMBER(utf8proc_islower(nCode));
+	}
+}
+
+RING_FUNC(ring_utf8proc_isupper)
+{
+	utf8proc_int32_t nCode ;
+	if ( ringutf8proc_getcodeparameter(pPointer,&nCode) ) {
+		RING_API_RETNUMBER(utf8proc_isupper(nCode));
+	}
+}
+
+RING_FUNC(ring_utf8proc_charwidth)
+{
+	utf8proc_int32_t nCode ;
+	if ( ringutf8proc_getcodeparameter(pPointer,&nCode) ) {
+		RING_API_RETNUMBER(utf8proc_charwidth(nCode));
+	}
+}
+
+RING_FUNC(ring_utf8proc_charwidth_ambiguous)
+{
+	utf8proc_int32_t nCode ;
+	if ( ringutf8proc_getcodeparameter(pPointer,&nCode) ) {
+		RING_API_RETNUMBER(utf8proc_charwidth_ambiguous(nCode) ? 1 : 0);
+	}
+}
+
+RING_FUNC(ring_utf8proc_category)
+{
+	utf8proc_int32_t nCode ;
+	if ( ringutf8proc_getcodeparameter(pPointer,&nCode) ) {
+		RING_API_RETNUMBER(utf8proc_category(nCode));
+	}
+}
+
+RING_FUNC(ring_utf8proc_category_string)
+{
+	utf8proc_int32_t nCode ;
+	if ( ringutf8proc_getcodeparameter(pPointer,&nCode) ) {
+		RING_API_RETSTRING(utf8proc_category_string(nCode));
+	}
+}
+
+RING_FUNC(ring_utf8proc_grapheme_break)
+{
+	if ( RING_API_PARACOUNT != 2 ) {
+		RING_API_ERROR(RING_API_MISS2PARA);
+		return ;
+	}
+	if ( ! ( RING_API_ISNUMBER(1) && RING_API_ISNUMBER(2) ) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return ;
+	}
+	if ( ! ( ringutf8proc_iscodepoint(pPointer,1) && ringutf8proc_iscodepoint(pPointer,2) ) ) {
+		RING_API_ERROR(RING_API_BADPARARANGE);
+		return ;
+	}
+	RING_API_RETNUMBER(utf8proc_grapheme_break((utf8proc_int32_t) RING_API_GETNUMBER(1),(utf8proc_int32_t) RING_API_GETNUMBER(2)) ? 1 : 0);
+}
+
+/* --- utf8proc_map(cStr, nOptions): map a string using a combination of the UTF8PROC_* options --- */
+RING_FUNC(ring_utf8proc_map)
+{
+	if ( RING_API_PARACOUNT != 2 ) {
+		RING_API_ERROR(RING_API_MISS2PARA);
+		return ;
+	}
+	if ( ! ( RING_API_ISSTRING(1) && RING_API_ISNUMBER(2) ) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return ;
+	}
+	ringutf8proc_retmap(pPointer,RING_API_GETSTRING(1),RING_API_GETSTRINGSIZE(1),(unsigned int) RING_API_GETNUMBER(2));
+}
+
+/* --- Normalization forms (same options as the utf8proc functions, but return Ring strings) --- */
+RING_FUNC(ring_utf8proc_NFD)
+{
+	ringutf8proc_mapparameter(pPointer,UTF8PROC_STABLE | UTF8PROC_DECOMPOSE);
+}
+
+RING_FUNC(ring_utf8proc_NFC)
+{
+	ringutf8proc_mapparameter(pPointer,UTF8PROC_STABLE | UTF8PROC_COMPOSE);
+}
+
+RING_FUNC(ring_utf8proc_NFKD)
+{
+	ringutf8proc_mapparameter(pPointer,UTF8PROC_STABLE | UTF8PROC_DECOMPOSE | UTF8PROC_COMPAT);
+}
+
+RING_FUNC(ring_utf8proc_NFKC)
+{
+	ringutf8proc_mapparameter(pPointer,UTF8PROC_STABLE | UTF8PROC_COMPOSE | UTF8PROC_COMPAT);
+}
+
+RING_FUNC(ring_utf8proc_NFKC_Casefold)
+{
+	ringutf8proc_mapparameter(pPointer,UTF8PROC_STABLE | UTF8PROC_COMPOSE | UTF8PROC_COMPAT | UTF8PROC_CASEFOLD | UTF8PROC_IGNORE);
+}
+
+/* --- utf8proc_encode_char(nCodepoint): return the UTF-8 string of a codepoint --- */
+RING_FUNC(ring_utf8proc_encode_char)
+{
+	utf8proc_uint8_t aBuffer[RING_UTF8PROC_MAXCHARBYTES] ;
+	utf8proc_ssize_t nBytes ;
+	if ( RING_API_PARACOUNT != 1 ) {
+		RING_API_ERROR(RING_API_MISS1PARA);
+		return ;
+	}
+	if ( ! RING_API_ISNUMBER(1) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return ;
+	}
+	if ( ! ( ringutf8proc_iscodepoint(pPointer,1) && utf8proc_codepoint_valid((utf8proc_int32_t) RING_API_GETNUMBER(1)) ) ) {
+		RING_API_ERROR(RING_API_BADPARARANGE);
+		return ;
+	}
+	nBytes = utf8proc_encode_char((utf8proc_int32_t) RING_API_GETNUMBER(1),aBuffer);
+	RING_API_RETSTRING2((const char *) aBuffer,(unsigned int) nBytes);
+}
+
+/*
+**  utf8proc_iterate(cStr, nPos): read the codepoint that starts at byte nPos (1-based)
+**  Returns [nCodepoint, nBytes]; at the end of the string nBytes is 0,
+**  for invalid UTF-8 nCodepoint is -1 and nBytes is the (negative) error code
+*/
+RING_FUNC(ring_utf8proc_iterate)
+{
+	List *pList ;
+	utf8proc_ssize_t nSize, nPos, nBytes ;
+	utf8proc_int32_t nCode ;
+	if ( RING_API_PARACOUNT != 2 ) {
+		RING_API_ERROR(RING_API_MISS2PARA);
+		return ;
+	}
+	if ( ! ( RING_API_ISSTRING(1) && RING_API_ISNUMBER(2) ) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return ;
+	}
+	nSize = RING_API_GETSTRINGSIZE(1);
+	if ( (RING_API_GETNUMBER(2) < 1) || (RING_API_GETNUMBER(2) > nSize + 1) ) {
+		RING_API_ERROR(RING_API_BADPARARANGE);
+		return ;
+	}
+	nPos = (utf8proc_ssize_t) RING_API_GETNUMBER(2) - 1 ;
+	nBytes = ringutf8proc_next(RING_API_GETSTRING(1),nSize,nPos,&nCode);
+	pList = RING_API_NEWLIST ;
+	ring_list_adddouble_gc(RING_API_STATE,pList,nCode);
+	ring_list_adddouble_gc(RING_API_STATE,pList,(double) nBytes);
+	RING_API_RETLIST(pList);
+}
+
+/* Add a [cName, nValue] pair to the list */
+static void ringutf8proc_addpair ( void *pState, List *pList, const char *cName, double nValue )
+{
+	List *pPair ;
+	pPair = ring_list_newlist_gc(pState,pList);
+	ring_list_addstring_gc(pState,pPair,cName);
+	ring_list_adddouble_gc(pState,pPair,nValue);
+}
+
+/* --- utf8proc_get_property(nCodepoint): return the properties of a codepoint as a list of [key, value] pairs --- */
+RING_FUNC(ring_utf8proc_get_property)
+{
+	List *pList, *pPair ;
+	const utf8proc_property_t *pProperty ;
+	utf8proc_int32_t nCode ;
+	if ( RING_API_PARACOUNT != 1 ) {
+		RING_API_ERROR(RING_API_MISS1PARA);
+		return ;
+	}
+	if ( ! RING_API_ISNUMBER(1) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return ;
+	}
+	if ( ! ringutf8proc_iscodepoint(pPointer,1) ) {
+		RING_API_ERROR(RING_API_BADPARARANGE);
+		return ;
+	}
+	nCode = (utf8proc_int32_t) RING_API_GETNUMBER(1);
+	pProperty = utf8proc_get_property(nCode);
+	pList = RING_API_NEWLIST ;
+	ringutf8proc_addpair(RING_API_STATE,pList,"codepoint",nCode);
+	ringutf8proc_addpair(RING_API_STATE,pList,"category",pProperty->category);
+	pPair = ring_list_newlist_gc(RING_API_STATE,pList);
+	ring_list_addstring_gc(RING_API_STATE,pPair,"categorystring");
+	ring_list_addstring_gc(RING_API_STATE,pPair,utf8proc_category_string(nCode));
+	ringutf8proc_addpair(RING_API_STATE,pList,"combiningclass",pProperty->combining_class);
+	ringutf8proc_addpair(RING_API_STATE,pList,"bidiclass",pProperty->bidi_class);
+	ringutf8proc_addpair(RING_API_STATE,pList,"decomptype",pProperty->decomp_type);
+	ringutf8proc_addpair(RING_API_STATE,pList,"bidimirrored",pProperty->bidi_mirrored);
+	ringutf8proc_addpair(RING_API_STATE,pList,"compexclusion",pProperty->comp_exclusion);
+	ringutf8proc_addpair(RING_API_STATE,pList,"ignorable",pProperty->ignorable);
+	ringutf8proc_addpair(RING_API_STATE,pList,"controlboundary",pProperty->control_boundary);
+	ringutf8proc_addpair(RING_API_STATE,pList,"charwidth",utf8proc_charwidth(nCode));
+	ringutf8proc_addpair(RING_API_STATE,pList,"ambiguouswidth",pProperty->ambiguous_width);
+	ringutf8proc_addpair(RING_API_STATE,pList,"boundclass",pProperty->boundclass);
+	ringutf8proc_addpair(RING_API_STATE,pList,"indicconjunctbreak",pProperty->indic_conjunct_break);
+	ringutf8proc_addpair(RING_API_STATE,pList,"lowercase",utf8proc_tolower(nCode));
+	ringutf8proc_addpair(RING_API_STATE,pList,"uppercase",utf8proc_toupper(nCode));
+	ringutf8proc_addpair(RING_API_STATE,pList,"titlecase",utf8proc_totitle(nCode));
+	RING_API_RETLIST(pList);
+}
+
+/* --- utf8proc_decompose_char(nCodepoint, nOptions): return the list of codepoints of the decomposition --- */
+RING_FUNC(ring_utf8proc_decompose_char)
+{
+	List *pList ;
+	utf8proc_int32_t aBuffer[RING_UTF8PROC_DECOMPOSESIZE] ;
+	utf8proc_int32_t nBoundClass ;
+	utf8proc_ssize_t nResult, x ;
+	if ( RING_API_PARACOUNT != 2 ) {
+		RING_API_ERROR(RING_API_MISS2PARA);
+		return ;
+	}
+	if ( ! ( RING_API_ISNUMBER(1) && RING_API_ISNUMBER(2) ) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return ;
+	}
+	if ( ! ringutf8proc_iscodepoint(pPointer,1) ) {
+		RING_API_ERROR(RING_API_BADPARARANGE);
+		return ;
+	}
+	nBoundClass = 0 ;
+	nResult = utf8proc_decompose_char((utf8proc_int32_t) RING_API_GETNUMBER(1),aBuffer,RING_UTF8PROC_DECOMPOSESIZE,(unsigned int) RING_API_GETNUMBER(2),&nBoundClass);
+	if ( nResult < 0 ) {
+		ringutf8proc_error(pPointer,nResult);
+		return ;
+	}
+	if ( nResult > RING_UTF8PROC_DECOMPOSESIZE ) {
+		ringutf8proc_error(pPointer,UTF8PROC_ERROR_OVERFLOW);
+		return ;
+	}
+	pList = RING_API_NEWLIST ;
+	for ( x = 0 ; x < nResult ; x++ ) {
+		ring_list_adddouble_gc(RING_API_STATE,pList,aBuffer[x]);
+	}
+	RING_API_RETLIST(pList);
+}
+
+/*
+**  utf8proc_grapheme_break_stateful(nCodepoint1, nCodepoint2, nState)
+**  Returns [lBreak, nNewState]; start with nState = 0 and pass nNewState to the next call
+*/
+RING_FUNC(ring_utf8proc_grapheme_break_stateful)
+{
+	List *pList ;
+	utf8proc_int32_t nState ;
+	utf8proc_bool lBreak ;
+	if ( RING_API_PARACOUNT != 3 ) {
+		RING_API_ERROR(RING_API_MISS3PARA);
+		return ;
+	}
+	if ( ! ( RING_API_ISNUMBER(1) && RING_API_ISNUMBER(2) && RING_API_ISNUMBER(3) ) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return ;
+	}
+	if ( ! ( ringutf8proc_iscodepoint(pPointer,1) && ringutf8proc_iscodepoint(pPointer,2) ) ) {
+		RING_API_ERROR(RING_API_BADPARARANGE);
+		return ;
+	}
+	nState = (utf8proc_int32_t) RING_API_GETNUMBER(3);
+	lBreak = utf8proc_grapheme_break_stateful((utf8proc_int32_t) RING_API_GETNUMBER(1),(utf8proc_int32_t) RING_API_GETNUMBER(2),&nState);
+	pList = RING_API_NEWLIST ;
+	ring_list_adddouble_gc(RING_API_STATE,pList,lBreak ? 1 : 0);
+	ring_list_adddouble_gc(RING_API_STATE,pList,nState);
+	RING_API_RETLIST(pList);
+}
+
+/* --- utf8proc_isvalid(cStr): return true if the string is valid UTF-8 --- */
+RING_FUNC(ring_utf8proc_isvalid)
+{
+	const char *cStr ;
+	utf8proc_ssize_t nSize, nPos, nBytes ;
+	utf8proc_int32_t nCode ;
+	if ( ! ringutf8proc_checkstring(pPointer) ) {
+		return ;
+	}
+	cStr = RING_API_GETSTRING(1);
+	nSize = RING_API_GETSTRINGSIZE(1);
+	nPos = 0 ;
+	while ( (nBytes = ringutf8proc_next(cStr,nSize,nPos,&nCode)) > 0 ) {
+		nPos += nBytes ;
+	}
+	RING_API_RETNUMBER(nBytes == 0);
+}
+
+/* --- utf8proc_length(cStr): return the number of codepoints --- */
+RING_FUNC(ring_utf8proc_length)
+{
+	const char *cStr ;
+	utf8proc_ssize_t nSize, nPos, nBytes, nCount ;
+	utf8proc_int32_t nCode ;
+	if ( ! ringutf8proc_checkstring(pPointer) ) {
+		return ;
+	}
+	cStr = RING_API_GETSTRING(1);
+	nSize = RING_API_GETSTRINGSIZE(1);
+	nPos = 0 ;
+	nCount = 0 ;
+	while ( (nBytes = ringutf8proc_next(cStr,nSize,nPos,&nCode)) > 0 ) {
+		nPos += nBytes ;
+		nCount++ ;
+	}
+	if ( nBytes < 0 ) {
+		ringutf8proc_error(pPointer,nBytes);
+		return ;
+	}
+	RING_API_RETNUMBER((double) nCount);
+}
+
+/* --- utf8proc_strwidth(cStr): return the display width (terminal columns) of the string --- */
+RING_FUNC(ring_utf8proc_strwidth)
+{
+	const char *cStr ;
+	utf8proc_ssize_t nSize, nPos, nBytes, nWidth ;
+	utf8proc_int32_t nCode ;
+	if ( ! ringutf8proc_checkstring(pPointer) ) {
+		return ;
+	}
+	cStr = RING_API_GETSTRING(1);
+	nSize = RING_API_GETSTRINGSIZE(1);
+	nPos = 0 ;
+	nWidth = 0 ;
+	while ( (nBytes = ringutf8proc_next(cStr,nSize,nPos,&nCode)) > 0 ) {
+		nPos += nBytes ;
+		nWidth += utf8proc_charwidth(nCode);
+	}
+	if ( nBytes < 0 ) {
+		ringutf8proc_error(pPointer,nBytes);
+		return ;
+	}
+	RING_API_RETNUMBER((double) nWidth);
+}
+
+/* --- utf8proc_codepoints(cStr): return the list of codepoints --- */
+RING_FUNC(ring_utf8proc_codepoints)
+{
+	List *pList ;
+	const char *cStr ;
+	utf8proc_ssize_t nSize, nPos, nBytes ;
+	utf8proc_int32_t nCode ;
+	if ( ! ringutf8proc_checkstring(pPointer) ) {
+		return ;
+	}
+	cStr = RING_API_GETSTRING(1);
+	nSize = RING_API_GETSTRINGSIZE(1);
+	pList = RING_API_NEWLIST ;
+	nPos = 0 ;
+	while ( (nBytes = ringutf8proc_next(cStr,nSize,nPos,&nCode)) > 0 ) {
+		nPos += nBytes ;
+		ring_list_adddouble_gc(RING_API_STATE,pList,nCode);
+	}
+	if ( nBytes < 0 ) {
+		ringutf8proc_error(pPointer,nBytes);
+		return ;
+	}
+	RING_API_RETLIST(pList);
+}
+
+/* --- utf8proc_fromcodepoints(aCodepoints): return the UTF-8 string of a list of codepoints --- */
+RING_FUNC(ring_utf8proc_fromcodepoints)
+{
+	List *pList ;
+	utf8proc_uint8_t *pOutput ;
+	utf8proc_ssize_t nOutSize ;
+	utf8proc_int32_t nCode ;
+	double nValue ;
+	int x, nCount ;
+	if ( RING_API_PARACOUNT != 1 ) {
+		RING_API_ERROR(RING_API_MISS1PARA);
+		return ;
+	}
+	if ( ! RING_API_ISLIST(1) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return ;
+	}
+	pList = RING_API_GETLIST(1);
+	nCount = ring_list_getsize(pList);
+	for ( x = 1 ; x <= nCount ; x++ ) {
+		if ( ! ring_list_isnumber(pList,x) ) {
+			RING_API_ERROR(RING_API_BADPARATYPE);
+			return ;
+		}
+		nValue = ring_list_getdouble(pList,x);
+		if ( (nValue < 0) || (nValue > RING_UTF8PROC_MAXCODEPOINT) || ( ! utf8proc_codepoint_valid((utf8proc_int32_t) nValue) ) ) {
+			RING_API_ERROR(RING_API_BADPARARANGE);
+			return ;
+		}
+	}
+	pOutput = (utf8proc_uint8_t *) RING_API_MALLOC((size_t) nCount * RING_UTF8PROC_MAXCHARBYTES + 1);
+	if ( pOutput == NULL ) {
+		ringutf8proc_error(pPointer,UTF8PROC_ERROR_NOMEM);
+		return ;
+	}
+	nOutSize = 0 ;
+	for ( x = 1 ; x <= nCount ; x++ ) {
+		nCode = (utf8proc_int32_t) ring_list_getdouble(pList,x);
+		nOutSize += utf8proc_encode_char(nCode,pOutput + nOutSize);
+	}
+	RING_API_RETSTRING2((const char *) pOutput,(unsigned int) nOutSize);
+	RING_API_FREE(pOutput);
+}
+
+/*
+**  Split the string parameter into grapheme clusters (UAX 29)
+**  Adds each cluster to pList when it is not NULL, and returns the number of clusters
+**  Returns a negative error code for invalid UTF-8
+*/
+static utf8proc_ssize_t ringutf8proc_splitgraphemes ( void *pPointer, List *pList )
+{
+	RingUTF8ProcGraphemes oIter ;
+	utf8proc_ssize_t nStart, nEnd, nResult, nCount ;
+	ringutf8proc_graphemesinit(&oIter,RING_API_GETSTRING(1),RING_API_GETSTRINGSIZE(1));
+	nCount = 0 ;
+	while ( (nResult = ringutf8proc_graphemesnext(&oIter,&nStart,&nEnd)) > 0 ) {
+		if ( pList != NULL ) {
+			ring_list_addstring2_gc(RING_API_STATE,pList,oIter.cStr + nStart,(unsigned int) (nEnd - nStart));
+		}
+		nCount++ ;
+	}
+	if ( nResult < 0 ) {
+		return nResult ;
+	}
+	return nCount ;
+}
+
+/* --- utf8proc_graphemes(cStr): return the list of grapheme clusters (user-perceived characters) --- */
+RING_FUNC(ring_utf8proc_graphemes)
+{
+	List *pList ;
+	utf8proc_ssize_t nResult ;
+	if ( ! ringutf8proc_checkstring(pPointer) ) {
+		return ;
+	}
+	pList = RING_API_NEWLIST ;
+	nResult = ringutf8proc_splitgraphemes(pPointer,pList);
+	if ( nResult < 0 ) {
+		ringutf8proc_error(pPointer,nResult);
+		return ;
+	}
+	RING_API_RETLIST(pList);
+}
+
+/* --- utf8proc_graphemecount(cStr): return the number of grapheme clusters --- */
+RING_FUNC(ring_utf8proc_graphemecount)
+{
+	utf8proc_ssize_t nResult ;
+	if ( ! ringutf8proc_checkstring(pPointer) ) {
+		return ;
+	}
+	nResult = ringutf8proc_splitgraphemes(pPointer,NULL);
+	if ( nResult < 0 ) {
+		ringutf8proc_error(pPointer,nResult);
+		return ;
+	}
+	RING_API_RETNUMBER((double) nResult);
+}
+
+/* --- Case conversion of whole strings (one codepoint to one codepoint) --- */
+RING_FUNC(ring_utf8proc_lowerstring)
+{
+	ringutf8proc_convertcase(pPointer,RING_UTF8PROC_CASELOWER);
+}
+
+RING_FUNC(ring_utf8proc_upperstring)
+{
+	ringutf8proc_convertcase(pPointer,RING_UTF8PROC_CASEUPPER);
+}
+
+RING_FUNC(ring_utf8proc_titlestring)
+{
+	ringutf8proc_convertcase(pPointer,RING_UTF8PROC_CASETITLE);
+}
+
+/* --- utf8proc_displaywidth(cStr): terminal columns of the string, measured by grapheme clusters --- */
+RING_FUNC(ring_utf8proc_displaywidth)
+{
+	RingUTF8ProcGraphemes oIter ;
+	utf8proc_ssize_t nStart, nEnd, nResult, nWidth ;
+	if ( ! ringutf8proc_checkstring(pPointer) ) {
+		return ;
+	}
+	ringutf8proc_graphemesinit(&oIter,RING_API_GETSTRING(1),RING_API_GETSTRINGSIZE(1));
+	nWidth = 0 ;
+	while ( (nResult = ringutf8proc_graphemesnext(&oIter,&nStart,&nEnd)) > 0 ) {
+		nWidth += ringutf8proc_graphemewidth(oIter.cStr,nStart,nEnd);
+	}
+	if ( nResult < 0 ) {
+		ringutf8proc_error(pPointer,nResult);
+		return ;
+	}
+	RING_API_RETNUMBER((double) nWidth);
+}
+
+/* Check the parameters (cStr, nWidth) and return the width, or -1 after raising an error */
+static double ringutf8proc_getwidthparameters ( void *pPointer, double nMinWidth )
+{
+	double nWidth ;
+	if ( RING_API_PARACOUNT != 2 ) {
+		RING_API_ERROR(RING_API_MISS2PARA);
+		return -1 ;
+	}
+	if ( ! ( RING_API_ISSTRING(1) && RING_API_ISNUMBER(2) ) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return -1 ;
+	}
+	nWidth = RING_API_GETNUMBER(2);
+	if ( nWidth < nMinWidth ) {
+		RING_API_ERROR(RING_API_BADPARARANGE);
+		return -1 ;
+	}
+	return nWidth ;
+}
+
+/* --- utf8proc_truncatewidth(cStr, nWidth): the leading grapheme clusters that fit in nWidth columns --- */
+RING_FUNC(ring_utf8proc_truncatewidth)
+{
+	RingUTF8ProcGraphemes oIter ;
+	utf8proc_ssize_t nStart, nEnd, nResult, nCut ;
+	double nMaxWidth, nWidth ;
+	nMaxWidth = ringutf8proc_getwidthparameters(pPointer,0);
+	if ( nMaxWidth < 0 ) {
+		return ;
+	}
+	ringutf8proc_graphemesinit(&oIter,RING_API_GETSTRING(1),RING_API_GETSTRINGSIZE(1));
+	nWidth = 0 ;
+	nCut = 0 ;
+	while ( (nResult = ringutf8proc_graphemesnext(&oIter,&nStart,&nEnd)) > 0 ) {
+		nWidth += ringutf8proc_graphemewidth(oIter.cStr,nStart,nEnd);
+		if ( nWidth > nMaxWidth ) {
+			break ;
+		}
+		nCut = nEnd ;
+	}
+	if ( nResult < 0 ) {
+		ringutf8proc_error(pPointer,nResult);
+		return ;
+	}
+	RING_API_RETSTRING2(oIter.cStr,(unsigned int) nCut);
+}
+
+/* Add the line cStr[nStart..nEnd) to the list without the space separators at the end */
+static void ringutf8proc_addline ( void *pState, List *pList, const char *cStr, utf8proc_ssize_t nStart, utf8proc_ssize_t nEnd )
+{
+	utf8proc_ssize_t nLast ;
+	utf8proc_int32_t nCode ;
+	while ( nEnd > nStart ) {
+		/* Find the start of the last codepoint (skip the UTF-8 continuation bytes) */
+		nLast = nEnd - 1 ;
+		while ( (nLast > nStart) && ((cStr[nLast] & 0xC0) == 0x80) ) {
+			nLast-- ;
+		}
+		/* A space separator (like U+3000) is never joined to the previous cluster */
+		if ( (ringutf8proc_next(cStr,nEnd,nLast,&nCode) != nEnd - nLast) || (utf8proc_category(nCode) != UTF8PROC_CATEGORY_ZS) ) {
+			break ;
+		}
+		nEnd = nLast ;
+	}
+	ring_list_addstring2_gc(pState,pList,cStr + nStart,(unsigned int) (nEnd - nStart));
+}
+
+/*
+**  utf8proc_wrap(cStr, nWidth): split the text into lines of at most nWidth columns
+**  Lines break at spaces, before and after wide (East Asian) characters, and at line breaks
+**  A line doesn't start with closing punctuation or end with an opening bracket next to wide characters
+**  A word longer than the line is split between grapheme clusters
+*/
+RING_FUNC(ring_utf8proc_wrap)
+{
+	RingUTF8ProcGraphemes oIter ;
+	List *pList ;
+	const char *cStr ;
+	utf8proc_ssize_t nStart, nEnd, nResult, nLineStart, nBreakEnd, nBreakNext ;
+	double nMaxWidth, nWidth, nBreakWidth ;
+	int nCharWidth, lWrapped, lWide, lPrevWide, lPrevOpening ;
+	utf8proc_category_t nCategory ;
+	nMaxWidth = ringutf8proc_getwidthparameters(pPointer,1);
+	if ( nMaxWidth < 0 ) {
+		return ;
+	}
+	cStr = RING_API_GETSTRING(1);
+	ringutf8proc_graphemesinit(&oIter,cStr,RING_API_GETSTRINGSIZE(1));
+	pList = RING_API_NEWLIST ;
+	nLineStart = 0 ;
+	nWidth = 0 ;
+	/* The last place where the line can be broken: the line ends at nBreakEnd and the next one starts at nBreakNext */
+	nBreakEnd = -1 ;
+	nBreakNext = 0 ;
+	nBreakWidth = 0 ;
+	/* The current line started because the previous line was too long */
+	lWrapped = 0 ;
+	/* The previous grapheme cluster was a wide character, or an opening bracket or quote */
+	lPrevWide = 0 ;
+	lPrevOpening = 0 ;
+	while ( (nResult = ringutf8proc_graphemesnext(&oIter,&nStart,&nEnd)) > 0 ) {
+		if ( ringutf8proc_graphemeisnewline(cStr,nStart) ) {
+			ringutf8proc_addline(RING_API_STATE,pList,cStr,nLineStart,nStart);
+			nLineStart = nEnd ;
+			nWidth = 0 ;
+			nBreakEnd = -1 ;
+			lWrapped = 0 ;
+			lPrevWide = 0 ;
+			lPrevOpening = 0 ;
+			continue ;
+		}
+		if ( ringutf8proc_graphemeisspace(cStr,nStart,nEnd) ) {
+			if ( lWrapped && (nStart == nLineStart) ) {
+				/* Spaces at the start of a wrapped line are removed */
+				nLineStart = nEnd ;
+				continue ;
+			}
+			nWidth += ringutf8proc_graphemewidth(cStr,nStart,nEnd);
+			nBreakEnd = nStart ;
+			nBreakNext = nEnd ;
+			nBreakWidth = nWidth ;
+			lPrevWide = 0 ;
+			lPrevOpening = 0 ;
+			continue ;
+		}
+		nCharWidth = ringutf8proc_graphemewidth(cStr,nStart,nEnd);
+		lWide = nCharWidth == RING_UTF8PROC_WIDEWIDTH ;
+		nCategory = ringutf8proc_graphemecategory(cStr,nStart,nEnd);
+		/*
+		**  The line can break before or after a wide character,
+		**  but not before closing punctuation (like a full stop) or after an opening bracket
+		*/
+		if ( (lWide || lPrevWide) && (nStart > nLineStart) && ( ! lPrevOpening ) &&
+		     ( ! ringutf8proc_isclosingpunct(nCategory) ) ) {
+			nBreakEnd = nStart ;
+			nBreakNext = nStart ;
+			nBreakWidth = nWidth ;
+		}
+		if ( (nWidth + nCharWidth > nMaxWidth) && (nStart > nLineStart) ) {
+			if ( nBreakEnd != -1 ) {
+				ringutf8proc_addline(RING_API_STATE,pList,cStr,nLineStart,nBreakEnd);
+				nLineStart = nBreakNext ;
+				nWidth -= nBreakWidth ;
+			}
+			nBreakEnd = -1 ;
+			lWrapped = 1 ;
+			/* The rest of the word is still too long: split it here */
+			if ( (nWidth + nCharWidth > nMaxWidth) && (nStart > nLineStart) ) {
+				ringutf8proc_addline(RING_API_STATE,pList,cStr,nLineStart,nStart);
+				nLineStart = nStart ;
+				nWidth = 0 ;
+			}
+		}
+		nWidth += nCharWidth ;
+		lPrevWide = lWide ;
+		lPrevOpening = (nCategory == UTF8PROC_CATEGORY_PS) || (nCategory == UTF8PROC_CATEGORY_PI) ;
+	}
+	if ( nResult < 0 ) {
+		ringutf8proc_error(pPointer,nResult);
+		return ;
+	}
+	if ( (nLineStart < oIter.nSize) || (ring_list_getsize(pList) == 0) ) {
+		ringutf8proc_addline(RING_API_STATE,pList,cStr,nLineStart,oIter.nSize);
+	}
+	RING_API_RETLIST(pList);
+}
+
+/*
+**  utf8proc_words(cStr): the list of words (letters, marks and numbers)
+**  An apostrophe between two word characters is part of the word (like don't)
+*/
+RING_FUNC(ring_utf8proc_words)
+{
+	List *pList ;
+	const char *cStr ;
+	utf8proc_ssize_t nSize, nPos, nBytes, nWordStart, nWordEnd ;
+	utf8proc_int32_t nCode, nNextCode ;
+	if ( ! ringutf8proc_checkstring(pPointer) ) {
+		return ;
+	}
+	cStr = RING_API_GETSTRING(1);
+	nSize = RING_API_GETSTRINGSIZE(1);
+	pList = RING_API_NEWLIST ;
+	nPos = 0 ;
+	nWordStart = -1 ;
+	nWordEnd = 0 ;
+	while ( (nBytes = ringutf8proc_next(cStr,nSize,nPos,&nCode)) > 0 ) {
+		if ( ringutf8proc_iswordchar(nCode) ) {
+			if ( nWordStart == -1 ) {
+				nWordStart = nPos ;
+			}
+			nWordEnd = nPos + nBytes ;
+		}
+		else if ( nWordStart != -1 ) {
+			if ( ! ( ringutf8proc_isapostrophe(nCode) && (ringutf8proc_next(cStr,nSize,nPos + nBytes,&nNextCode) > 0) &&
+			         ringutf8proc_iswordchar(nNextCode) ) ) {
+				ring_list_addstring2_gc(RING_API_STATE,pList,cStr + nWordStart,(unsigned int) (nWordEnd - nWordStart));
+				nWordStart = -1 ;
+			}
+		}
+		nPos += nBytes ;
+	}
+	if ( nBytes < 0 ) {
+		ringutf8proc_error(pPointer,nBytes);
+		return ;
+	}
+	if ( nWordStart != -1 ) {
+		ring_list_addstring2_gc(RING_API_STATE,pList,cStr + nWordStart,(unsigned int) (nWordEnd - nWordStart));
+	}
+	RING_API_RETLIST(pList);
+}
+
+/* --- utf8proc_replaceinvalid(cStr): replace each byte that is not part of valid UTF-8 with U+FFFD --- */
+RING_FUNC(ring_utf8proc_replaceinvalid)
+{
+	const char *cStr ;
+	char *pOutput ;
+	utf8proc_ssize_t nSize, nPos, nBytes, nOutSize ;
+	utf8proc_int32_t nCode ;
+	if ( ! ringutf8proc_checkstring(pPointer) ) {
+		return ;
+	}
+	cStr = RING_API_GETSTRING(1);
+	nSize = RING_API_GETSTRINGSIZE(1);
+	if ( ! ringutf8proc_checksize(pPointer,nSize) ) {
+		return ;
+	}
+	pOutput = (char *) RING_API_MALLOC(nSize * RING_UTF8PROC_REPLACEMENTSIZE + 1);
+	if ( pOutput == NULL ) {
+		ringutf8proc_error(pPointer,UTF8PROC_ERROR_NOMEM);
+		return ;
+	}
+	nPos = 0 ;
+	nOutSize = 0 ;
+	while ( nPos < nSize ) {
+		nBytes = ringutf8proc_next(cStr,nSize,nPos,&nCode);
+		if ( nBytes > 0 ) {
+			memcpy(pOutput + nOutSize,cStr + nPos,nBytes);
+			nOutSize += nBytes ;
+			nPos += nBytes ;
+		}
+		else {
+			memcpy(pOutput + nOutSize,RING_UTF8PROC_REPLACEMENT,RING_UTF8PROC_REPLACEMENTSIZE);
+			nOutSize += RING_UTF8PROC_REPLACEMENTSIZE ;
+			nPos++ ;
+		}
+	}
+	RING_API_RETSTRING2(pOutput,(unsigned int) nOutSize);
+	RING_API_FREE(pOutput);
+}
+/* Return true for white space: space separators, line and paragraph separators, tab, LF, VT, FF, CR and NEL */
+static int ringutf8proc_iswhitespace ( utf8proc_int32_t nCode )
+{
+	utf8proc_category_t nCategory ;
+	if ( ((nCode >= 0x09) && (nCode <= 0x0D)) || (nCode == 0x85) ) {
+		return 1 ;
+	}
+	nCategory = utf8proc_category(nCode);
+	return (nCategory == UTF8PROC_CATEGORY_ZS) || (nCategory == UTF8PROC_CATEGORY_ZL) || (nCategory == UTF8PROC_CATEGORY_ZP) ;
+}
+
+/* Return true if all the codepoints of the grapheme cluster cStr[nStart..nEnd) are white space (like CR LF) */
+static int ringutf8proc_graphemeiswhitespace ( const char *cStr, utf8proc_ssize_t nStart, utf8proc_ssize_t nEnd )
+{
+	utf8proc_ssize_t nBytes ;
+	utf8proc_int32_t nCode ;
+	while ( (nBytes = ringutf8proc_next(cStr,nEnd,nStart,&nCode)) > 0 ) {
+		if ( ! ringutf8proc_iswhitespace(nCode) ) {
+			return 0 ;
+		}
+		nStart += nBytes ;
+	}
+	return 1 ;
+}
+
+/* Remove white space (whole grapheme clusters) from the start and/or the end of the string parameter */
+static void ringutf8proc_trimparameter ( void *pPointer, int lLeft, int lRight )
+{
+	RingUTF8ProcGraphemes oIter ;
+	utf8proc_ssize_t nStart, nEnd, nResult, nFirst, nLast ;
+	if ( ! ringutf8proc_checkstring(pPointer) ) {
+		return ;
+	}
+	ringutf8proc_graphemesinit(&oIter,RING_API_GETSTRING(1),RING_API_GETSTRINGSIZE(1));
+	nFirst = -1 ;
+	nLast = 0 ;
+	while ( (nResult = ringutf8proc_graphemesnext(&oIter,&nStart,&nEnd)) > 0 ) {
+		if ( ! ringutf8proc_graphemeiswhitespace(oIter.cStr,nStart,nEnd) ) {
+			if ( nFirst == -1 ) {
+				nFirst = nStart ;
+			}
+			nLast = nEnd ;
+		}
+	}
+	if ( nResult < 0 ) {
+		ringutf8proc_error(pPointer,nResult);
+		return ;
+	}
+	if ( nFirst == -1 ) {
+		/* The string is empty or contains only white space */
+		RING_API_RETSTRING("");
+		return ;
+	}
+	if ( ! lLeft ) {
+		nFirst = 0 ;
+	}
+	if ( ! lRight ) {
+		nLast = oIter.nSize ;
+	}
+	RING_API_RETSTRING2(oIter.cStr + nFirst,(unsigned int) (nLast - nFirst));
+}
+
+RING_FUNC(ring_utf8proc_trim)
+{
+	ringutf8proc_trimparameter(pPointer,1,1);
+}
+
+RING_FUNC(ring_utf8proc_trimleft)
+{
+	ringutf8proc_trimparameter(pPointer,1,0);
+}
+
+RING_FUNC(ring_utf8proc_trimright)
+{
+	ringutf8proc_trimparameter(pPointer,0,1);
+}
+
+/*
+**  Mark the grapheme cluster boundaries of the first string parameter
+**  Returns an array of nSize + 1 flags (1 where a cluster starts, and at nSize), freed using RING_API_FREE()
+**  Returns NULL after raising an error (invalid UTF-8 or no memory)
+*/
+static char *ringutf8proc_boundaries ( void *pPointer, const char *cStr, utf8proc_ssize_t nSize )
+{
+	RingUTF8ProcGraphemes oIter ;
+	utf8proc_ssize_t nStart, nEnd, nResult ;
+	char *aBoundary ;
+	aBoundary = (char *) RING_API_MALLOC(nSize + 1);
+	if ( aBoundary == NULL ) {
+		ringutf8proc_error(pPointer,UTF8PROC_ERROR_NOMEM);
+		return NULL ;
+	}
+	memset(aBoundary,0,nSize + 1);
+	ringutf8proc_graphemesinit(&oIter,cStr,nSize);
+	while ( (nResult = ringutf8proc_graphemesnext(&oIter,&nStart,&nEnd)) > 0 ) {
+		aBoundary[nStart] = 1 ;
+	}
+	if ( nResult < 0 ) {
+		RING_API_FREE(aBoundary);
+		ringutf8proc_error(pPointer,nResult);
+		return NULL ;
+	}
+	aBoundary[nSize] = 1 ;
+	return aBoundary ;
+}
+
+/* Return true if cPart (nPartSize bytes) is at cStr[nPos], starting and ending at grapheme cluster boundaries */
+static int ringutf8proc_matchat ( const char *cStr, utf8proc_ssize_t nSize, const char *aBoundary, utf8proc_ssize_t nPos,
+				  const char *cPart, utf8proc_ssize_t nPartSize )
+{
+	return aBoundary[nPos] && (nPos + nPartSize <= nSize) && aBoundary[nPos + nPartSize] &&
+	       (memcmp(cStr + nPos,cPart,nPartSize) == 0) ;
+}
+
+/*
+**  utf8proc_find(cStr, cSubStr): position (in grapheme clusters, starting from 1) of the first match, or 0
+**  A match starts and ends at cluster boundaries (searching "e" doesn't find the e in "e" + U+0301)
+*/
+RING_FUNC(ring_utf8proc_find)
+{
+	const char *cStr, *cPart ;
+	char *aBoundary ;
+	utf8proc_ssize_t nSize, nPartSize, nPos, nIndex ;
+	if ( RING_API_PARACOUNT != 2 ) {
+		RING_API_ERROR(RING_API_MISS2PARA);
+		return ;
+	}
+	if ( ! ( RING_API_ISSTRING(1) && RING_API_ISSTRING(2) ) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return ;
+	}
+	cStr = RING_API_GETSTRING(1);
+	nSize = RING_API_GETSTRINGSIZE(1);
+	cPart = RING_API_GETSTRING(2);
+	nPartSize = RING_API_GETSTRINGSIZE(2);
+	aBoundary = ringutf8proc_boundaries(pPointer,cStr,nSize);
+	if ( aBoundary == NULL ) {
+		return ;
+	}
+	nIndex = 0 ;
+	if ( nPartSize > 0 ) {
+		for ( nPos = 0 ; nPos + nPartSize <= nSize ; nPos++ ) {
+			if ( aBoundary[nPos] ) {
+				nIndex++ ;
+				if ( ringutf8proc_matchat(cStr,nSize,aBoundary,nPos,cPart,nPartSize) ) {
+					RING_API_FREE(aBoundary);
+					RING_API_RETNUMBER((double) nIndex);
+					return ;
+				}
+			}
+		}
+	}
+	RING_API_FREE(aBoundary);
+	RING_API_RETNUMBER(0);
+}
+
+/*
+**  utf8proc_replace(cStr, cOld, cNew): replace all the matches of cOld (at grapheme cluster boundaries) with cNew
+**  The strings may contain char(0)
+*/
+RING_FUNC(ring_utf8proc_replace)
+{
+	const char *cStr, *cOld, *cNew ;
+	char *aBoundary, *pOutput ;
+	utf8proc_ssize_t nSize, nOldSize, nNewSize, nPos, nCount, nOutSize ;
+	double nTotal ;
+	if ( RING_API_PARACOUNT != 3 ) {
+		RING_API_ERROR(RING_API_MISS3PARA);
+		return ;
+	}
+	if ( ! ( RING_API_ISSTRING(1) && RING_API_ISSTRING(2) && RING_API_ISSTRING(3) ) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return ;
+	}
+	cStr = RING_API_GETSTRING(1);
+	nSize = RING_API_GETSTRINGSIZE(1);
+	cOld = RING_API_GETSTRING(2);
+	nOldSize = RING_API_GETSTRINGSIZE(2);
+	cNew = RING_API_GETSTRING(3);
+	nNewSize = RING_API_GETSTRINGSIZE(3);
+	aBoundary = ringutf8proc_boundaries(pPointer,cStr,nSize);
+	if ( aBoundary == NULL ) {
+		return ;
+	}
+	/* Count the matches to allocate the result */
+	nCount = 0 ;
+	nPos = 0 ;
+	while ( (nOldSize > 0) && (nPos < nSize) ) {
+		if ( ringutf8proc_matchat(cStr,nSize,aBoundary,nPos,cOld,nOldSize) ) {
+			nCount++ ;
+			nPos += nOldSize ;
+		}
+		else {
+			nPos++ ;
+		}
+	}
+	nTotal = (double) nSize + (double) nCount * ((double) nNewSize - (double) nOldSize) ;
+	if ( nTotal > INT_MAX ) {
+		RING_API_FREE(aBoundary);
+		ringutf8proc_error(pPointer,UTF8PROC_ERROR_OVERFLOW);
+		return ;
+	}
+	pOutput = (char *) RING_API_MALLOC((size_t) nTotal + 1);
+	if ( pOutput == NULL ) {
+		RING_API_FREE(aBoundary);
+		ringutf8proc_error(pPointer,UTF8PROC_ERROR_NOMEM);
+		return ;
+	}
+	nOutSize = 0 ;
+	nPos = 0 ;
+	while ( nPos < nSize ) {
+		if ( (nCount > 0) && (nOldSize > 0) && ringutf8proc_matchat(cStr,nSize,aBoundary,nPos,cOld,nOldSize) ) {
+			memcpy(pOutput + nOutSize,cNew,nNewSize);
+			nOutSize += nNewSize ;
+			nPos += nOldSize ;
+		}
+		else {
+			pOutput[nOutSize++] = cStr[nPos++] ;
+		}
+	}
+	RING_API_RETSTRING2(pOutput,(unsigned int) nOutSize);
+	RING_API_FREE(pOutput);
+	RING_API_FREE(aBoundary);
+}
+/* Growable output buffer (allocated using RING_API_MALLOC) */
+typedef struct RingUTF8ProcBuffer {
+	char *pData ;
+	utf8proc_ssize_t nSize ;
+	utf8proc_ssize_t nCapacity ;
+} RingUTF8ProcBuffer ;
+
+static int ringutf8proc_bufferinit ( void *pPointer, RingUTF8ProcBuffer *pBuffer, utf8proc_ssize_t nCapacity )
+{
+	pBuffer->nSize = 0 ;
+	pBuffer->nCapacity = nCapacity ;
+	pBuffer->pData = (char *) RING_API_MALLOC(nCapacity + 1);
+	if ( pBuffer->pData == NULL ) {
+		ringutf8proc_error(pPointer,UTF8PROC_ERROR_NOMEM);
+		return 0 ;
+	}
+	return 1 ;
+}
+
+/* Add bytes to the buffer; returns 0 after raising an error (the buffer is freed) */
+static int ringutf8proc_bufferadd ( void *pPointer, RingUTF8ProcBuffer *pBuffer, const char *cData, utf8proc_ssize_t nBytes )
+{
+	utf8proc_ssize_t nCapacity ;
+	char *pData ;
+	if ( pBuffer->nSize + nBytes > pBuffer->nCapacity ) {
+		nCapacity = pBuffer->nCapacity * 2 ;
+		if ( nCapacity < pBuffer->nSize + nBytes ) {
+			nCapacity = pBuffer->nSize + nBytes ;
+		}
+		if ( nCapacity > INT_MAX - 1 ) {
+			RING_API_FREE(pBuffer->pData);
+			ringutf8proc_error(pPointer,UTF8PROC_ERROR_OVERFLOW);
+			return 0 ;
+		}
+		pData = (char *) RING_API_REALLOC(pBuffer->pData,pBuffer->nCapacity + 1,nCapacity + 1);
+		if ( pData == NULL ) {
+			RING_API_FREE(pBuffer->pData);
+			ringutf8proc_error(pPointer,UTF8PROC_ERROR_NOMEM);
+			return 0 ;
+		}
+		pBuffer->pData = pData ;
+		pBuffer->nCapacity = nCapacity ;
+	}
+	memcpy(pBuffer->pData + pBuffer->nSize,cData,nBytes);
+	pBuffer->nSize += nBytes ;
+	return 1 ;
+}
+
+/* Return the buffer as the function result and free it */
+static void ringutf8proc_bufferreturn ( void *pPointer, RingUTF8ProcBuffer *pBuffer )
+{
+	RING_API_RETSTRING2(pBuffer->pData,(unsigned int) pBuffer->nSize);
+	RING_API_FREE(pBuffer->pData);
+}
+
+/* One item of the table used by utf8proc_mapchars() */
+typedef struct RingUTF8ProcMapItem {
+	utf8proc_int32_t nFrom ;
+	/* The new codepoint (-1 removes the character) when cTo is NULL */
+	utf8proc_int32_t nTo ;
+	const char *cTo ;
+	utf8proc_ssize_t nToSize ;
+	/* Position in the list: the first pair wins when a codepoint is repeated */
+	int nOrder ;
+} RingUTF8ProcMapItem ;
+
+static int ringutf8proc_compareitems ( const void *pFirst, const void *pSecond )
+{
+	const RingUTF8ProcMapItem *pItem1, *pItem2 ;
+	pItem1 = (const RingUTF8ProcMapItem *) pFirst ;
+	pItem2 = (const RingUTF8ProcMapItem *) pSecond ;
+	if ( pItem1->nFrom != pItem2->nFrom ) {
+		return (pItem1->nFrom < pItem2->nFrom) ? -1 : 1 ;
+	}
+	return pItem1->nOrder - pItem2->nOrder ;
+}
+
+/* Binary search (the first item of a repeated codepoint), returns NULL if the codepoint is not in the table */
+static RingUTF8ProcMapItem *ringutf8proc_finditem ( RingUTF8ProcMapItem *aItems, int nCount, utf8proc_int32_t nCode )
+{
+	int nLow, nHigh, nMiddle ;
+	nLow = 0 ;
+	nHigh = nCount ;
+	while ( nLow < nHigh ) {
+		nMiddle = nLow + (nHigh - nLow) / 2 ;
+		if ( aItems[nMiddle].nFrom < nCode ) {
+			nLow = nMiddle + 1 ;
+		}
+		else {
+			nHigh = nMiddle ;
+		}
+	}
+	if ( (nLow < nCount) && (aItems[nLow].nFrom == nCode) ) {
+		return &aItems[nLow] ;
+	}
+	return NULL ;
+}
+
+/* Check that the list item is a number that can be a codepoint (or -1 when lAllowRemove is true) */
+static int ringutf8proc_listcodepoint ( List *pList, int nIndex, int lAllowRemove, utf8proc_int32_t *pCode )
+{
+	double nValue ;
+	if ( ! ring_list_isnumber(pList,nIndex) ) {
+		return 0 ;
+	}
+	nValue = ring_list_getdouble(pList,nIndex);
+	if ( lAllowRemove && (nValue == -1) ) {
+		*pCode = -1 ;
+		return 1 ;
+	}
+	if ( (nValue < 0) || (nValue > RING_UTF8PROC_MAXCODEPOINT) || (nValue != (double) (utf8proc_int32_t) nValue) ) {
+		return 0 ;
+	}
+	*pCode = (utf8proc_int32_t) nValue ;
+	return utf8proc_codepoint_valid(*pCode) ;
+}
+
+/*
+**  utf8proc_mapchars(cStr, aPairs): replace characters using a list of [nFrom, vTo] pairs
+**  vTo is a codepoint, -1 (remove the character), or a string (may be empty or contain many characters)
+*/
+RING_FUNC(ring_utf8proc_mapchars)
+{
+	List *pPairs, *pPair ;
+	RingUTF8ProcMapItem *aItems, *pItem ;
+	RingUTF8ProcBuffer oBuffer ;
+	const char *cStr ;
+	utf8proc_uint8_t aChar[RING_UTF8PROC_MAXCHARBYTES] ;
+	utf8proc_ssize_t nSize, nPos, nBytes ;
+	utf8proc_int32_t nCode ;
+	int x, nCount, lOK ;
+	if ( RING_API_PARACOUNT != 2 ) {
+		RING_API_ERROR(RING_API_MISS2PARA);
+		return ;
+	}
+	if ( ! ( RING_API_ISSTRING(1) && RING_API_ISLIST(2) ) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return ;
+	}
+	cStr = RING_API_GETSTRING(1);
+	nSize = RING_API_GETSTRINGSIZE(1);
+	pPairs = RING_API_GETLIST(2);
+	nCount = ring_list_getsize(pPairs);
+	aItems = (RingUTF8ProcMapItem *) RING_API_MALLOC(sizeof(RingUTF8ProcMapItem) * (nCount + 1));
+	if ( aItems == NULL ) {
+		ringutf8proc_error(pPointer,UTF8PROC_ERROR_NOMEM);
+		return ;
+	}
+	for ( x = 1 ; x <= nCount ; x++ ) {
+		pItem = &aItems[x - 1] ;
+		pItem->nOrder = x ;
+		pItem->nTo = -1 ;
+		pItem->cTo = NULL ;
+		pItem->nToSize = 0 ;
+		if ( ! ring_list_islist(pPairs,x) ) {
+			RING_API_FREE(aItems);
+			RING_API_ERROR(RING_API_BADPARATYPE);
+			return ;
+		}
+		pPair = ring_list_getlist(pPairs,x);
+		if ( (ring_list_getsize(pPair) != 2) || ( ! ringutf8proc_listcodepoint(pPair,1,0,&pItem->nFrom) ) ) {
+			RING_API_FREE(aItems);
+			RING_API_ERROR(RING_API_BADPARAVALUE);
+			return ;
+		}
+		if ( ring_list_isstring(pPair,2) ) {
+			pItem->cTo = ring_list_getstring(pPair,2);
+			pItem->nToSize = ring_list_getstringsize(pPair,2);
+		}
+		else if ( ! ringutf8proc_listcodepoint(pPair,2,1,&pItem->nTo) ) {
+			RING_API_FREE(aItems);
+			RING_API_ERROR(RING_API_BADPARAVALUE);
+			return ;
+		}
+	}
+	qsort(aItems,nCount,sizeof(RingUTF8ProcMapItem),ringutf8proc_compareitems);
+	if ( ! ringutf8proc_bufferinit(pPointer,&oBuffer,nSize) ) {
+		RING_API_FREE(aItems);
+		return ;
+	}
+	nPos = 0 ;
+	lOK = 1 ;
+	while ( lOK && ((nBytes = ringutf8proc_next(cStr,nSize,nPos,&nCode)) > 0) ) {
+		pItem = ringutf8proc_finditem(aItems,nCount,nCode);
+		if ( pItem == NULL ) {
+			lOK = ringutf8proc_bufferadd(pPointer,&oBuffer,cStr + nPos,nBytes);
+		}
+		else if ( pItem->cTo != NULL ) {
+			lOK = ringutf8proc_bufferadd(pPointer,&oBuffer,pItem->cTo,pItem->nToSize);
+		}
+		else if ( pItem->nTo != -1 ) {
+			lOK = ringutf8proc_bufferadd(pPointer,&oBuffer,(const char *) aChar,utf8proc_encode_char(pItem->nTo,aChar));
+		}
+		nPos += nBytes ;
+	}
+	RING_API_FREE(aItems);
+	if ( ! lOK ) {
+		/* The buffer is freed and the error is raised by ringutf8proc_bufferadd() */
+		return ;
+	}
+	if ( nBytes < 0 ) {
+		RING_API_FREE(oBuffer.pData);
+		ringutf8proc_error(pPointer,nBytes);
+		return ;
+	}
+	ringutf8proc_bufferreturn(pPointer,&oBuffer);
+}
+
+/* Most codepoints to check backwards when looking for the zero of a block of decimal digits */
+#define RING_UTF8PROC_MAXDIGITSBLOCK 64
+
+/*
+**  Value (0 to 9) of a decimal digit (category Nd) of any script, or -1
+**  Unicode stores each set of decimal digits as consecutive codepoints from 0 to 9
+*/
+static int ringutf8proc_digitvalue ( utf8proc_int32_t nCode )
+{
+	utf8proc_int32_t nStart ;
+	if ( utf8proc_category(nCode) != UTF8PROC_CATEGORY_ND ) {
+		return -1 ;
+	}
+	nStart = nCode ;
+	while ( (nStart > 0) && (nCode - nStart < RING_UTF8PROC_MAXDIGITSBLOCK) &&
+		(utf8proc_category(nStart - 1) == UTF8PROC_CATEGORY_ND) ) {
+		nStart-- ;
+	}
+	return (int) ((nCode - nStart) % 10) ;
+}
+
+/* --- utf8proc_digitvalue(nCode): value of a decimal digit of any script (like U+0663 ARABIC-INDIC DIGIT THREE), or -1 --- */
+RING_FUNC(ring_utf8proc_digitvalue)
+{
+	utf8proc_int32_t nCode ;
+	if ( ringutf8proc_getcodeparameter(pPointer,&nCode) ) {
+		RING_API_RETNUMBER(ringutf8proc_digitvalue(nCode));
+	}
+}
+
+/* --- utf8proc_asciidigits(cStr): replace the decimal digits of all the scripts with the ASCII digits 0 to 9 --- */
+RING_FUNC(ring_utf8proc_asciidigits)
+{
+	RingUTF8ProcBuffer oBuffer ;
+	const char *cStr ;
+	char cDigit ;
+	utf8proc_ssize_t nSize, nPos, nBytes ;
+	utf8proc_int32_t nCode ;
+	int nValue ;
+	if ( ! ringutf8proc_checkstring(pPointer) ) {
+		return ;
+	}
+	cStr = RING_API_GETSTRING(1);
+	nSize = RING_API_GETSTRINGSIZE(1);
+	/* The result is never longer than the input (an ASCII digit uses one byte), so the buffer doesn't grow */
+	if ( ! ringutf8proc_bufferinit(pPointer,&oBuffer,nSize) ) {
+		return ;
+	}
+	nPos = 0 ;
+	while ( (nBytes = ringutf8proc_next(cStr,nSize,nPos,&nCode)) > 0 ) {
+		nValue = (nCode > 0x7F) ? ringutf8proc_digitvalue(nCode) : -1 ;
+		if ( nValue >= 0 ) {
+			cDigit = (char) ('0' + nValue) ;
+			ringutf8proc_bufferadd(pPointer,&oBuffer,&cDigit,1);
+		}
+		else {
+			ringutf8proc_bufferadd(pPointer,&oBuffer,cStr + nPos,nBytes);
+		}
+		nPos += nBytes ;
+	}
+	if ( nBytes < 0 ) {
+		RING_API_FREE(oBuffer.pData);
+		ringutf8proc_error(pPointer,nBytes);
+		return ;
+	}
+	ringutf8proc_bufferreturn(pPointer,&oBuffer);
+}
+
+/* --- utf8proc_countranges(cStr, aRanges): number of codepoints inside any of the [nFirst, nLast] ranges --- */
+RING_FUNC(ring_utf8proc_countranges)
+{
+	List *pRanges, *pRange ;
+	const char *cStr ;
+	utf8proc_ssize_t nSize, nPos, nBytes, nTotal ;
+	utf8proc_int32_t nCode ;
+	int x, nCount ;
+	if ( RING_API_PARACOUNT != 2 ) {
+		RING_API_ERROR(RING_API_MISS2PARA);
+		return ;
+	}
+	if ( ! ( RING_API_ISSTRING(1) && RING_API_ISLIST(2) ) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return ;
+	}
+	pRanges = RING_API_GETLIST(2);
+	nCount = ring_list_getsize(pRanges);
+	for ( x = 1 ; x <= nCount ; x++ ) {
+		if ( ! ring_list_islist(pRanges,x) ) {
+			RING_API_ERROR(RING_API_BADPARATYPE);
+			return ;
+		}
+		pRange = ring_list_getlist(pRanges,x);
+		if ( (ring_list_getsize(pRange) != 2) || ( ! ring_list_isnumber(pRange,1) ) || ( ! ring_list_isnumber(pRange,2) ) ) {
+			RING_API_ERROR(RING_API_BADPARAVALUE);
+			return ;
+		}
+	}
+	cStr = RING_API_GETSTRING(1);
+	nSize = RING_API_GETSTRINGSIZE(1);
+	nPos = 0 ;
+	nTotal = 0 ;
+	while ( (nBytes = ringutf8proc_next(cStr,nSize,nPos,&nCode)) > 0 ) {
+		for ( x = 1 ; x <= nCount ; x++ ) {
+			pRange = ring_list_getlist(pRanges,x);
+			if ( (nCode >= ring_list_getdouble(pRange,1)) && (nCode <= ring_list_getdouble(pRange,2)) ) {
+				nTotal++ ;
+				break ;
+			}
+		}
+		nPos += nBytes ;
+	}
+	if ( nBytes < 0 ) {
+		ringutf8proc_error(pPointer,nBytes);
+		return ;
+	}
+	RING_API_RETNUMBER((double) nTotal);
+}
+/* ========================================================================== */
+/*  Arabic Shaping                                                            */
+/* ========================================================================== */
+
+/* The base letters that have presentation forms are in the blocks U+0600 to U+08FF */
+#define RING_UTF8PROC_SHAPEFIRST 0x0600
+#define RING_UTF8PROC_SHAPELAST 0x08FF
+#define RING_UTF8PROC_SHAPECOUNT (RING_UTF8PROC_SHAPELAST - RING_UTF8PROC_SHAPEFIRST + 1)
+
+/* Characters with special joining behavior */
+#define RING_UTF8PROC_TATWEEL 0x0640
+#define RING_UTF8PROC_ZWNJ 0x200C
+#define RING_UTF8PROC_ZWJ 0x200D
+#define RING_UTF8PROC_LAM 0x0644
+
+/*
+**  The presentation forms of each base letter: [isolated, final, initial, medial] (0 = no form)
+**  Built from the Unicode data: a presentation form has the compatibility decomposition
+**  <isolated>, <final>, <initial> or <medial> to its base letter (like U+FE91 <initial> U+0628)
+*/
+static utf8proc_int32_t aRingUTF8ProcForms[RING_UTF8PROC_SHAPECOUNT][4] ;
+static int lRingUTF8ProcFormsReady = 0 ;
+
+static void ringutf8proc_buildforms ( void )
+{
+	static const utf8proc_int32_t aBlocks[2][2] = { { 0xFB50, 0xFDFF }, { 0xFE70, 0xFEFF } } ;
+	utf8proc_int32_t aBuffer[RING_UTF8PROC_DECOMPOSESIZE] ;
+	utf8proc_int32_t nCode, nBase, nBoundClass ;
+	utf8proc_ssize_t nLength ;
+	int x, nForm ;
+	if ( lRingUTF8ProcFormsReady ) {
+		return ;
+	}
+	memset(aRingUTF8ProcForms,0,sizeof(aRingUTF8ProcForms));
+	for ( x = 0 ; x < 2 ; x++ ) {
+		for ( nCode = aBlocks[x][0] ; nCode <= aBlocks[x][1] ; nCode++ ) {
+			switch ( utf8proc_get_property(nCode)->decomp_type ) {
+				case UTF8PROC_DECOMP_TYPE_ISOLATED :
+					nForm = 0 ;
+					break ;
+				case UTF8PROC_DECOMP_TYPE_FINAL :
+					nForm = 1 ;
+					break ;
+				case UTF8PROC_DECOMP_TYPE_INITIAL :
+					nForm = 2 ;
+					break ;
+				case UTF8PROC_DECOMP_TYPE_MEDIAL :
+					nForm = 3 ;
+					break ;
+				default :
+					nForm = -1 ;
+			}
+			if ( nForm == -1 ) {
+				continue ;
+			}
+			nBoundClass = 0 ;
+			nLength = utf8proc_decompose_char(nCode,aBuffer,RING_UTF8PROC_DECOMPOSESIZE,UTF8PROC_DECOMPOSE | UTF8PROC_COMPAT,&nBoundClass);
+			if ( (nLength <= 0) || (nLength > RING_UTF8PROC_DECOMPOSESIZE) ) {
+				continue ;
+			}
+			/* Compose again: U+FE81 decomposes to U+0627 U+0653 (the letter is U+0622 Alef with Madda) */
+			nLength = utf8proc_normalize_utf32(aBuffer,nLength,UTF8PROC_COMPOSE);
+			if ( nLength != 1 ) {
+				/* Ligatures (like Lam-Alef) and forms of marks are not used for single letters */
+				continue ;
+			}
+			nBase = aBuffer[0] ;
+			if ( (nBase >= RING_UTF8PROC_SHAPEFIRST) && (nBase <= RING_UTF8PROC_SHAPELAST) &&
+			     (aRingUTF8ProcForms[nBase - RING_UTF8PROC_SHAPEFIRST][nForm] == 0) ) {
+				aRingUTF8ProcForms[nBase - RING_UTF8PROC_SHAPEFIRST][nForm] = nCode ;
+			}
+		}
+	}
+	lRingUTF8ProcFormsReady = 1 ;
+}
+
+/*
+**  Joining type of a codepoint (the forms table must be ready)
+**  Dual: has initial or medial forms (like Beh), Right: final form only (like Alef, Dal, Reh, Waw),
+**  Causing: Tatweel and ZWJ join both sides, Transparent: marks and format characters (Tashkeel)
+*/
+static int ringutf8proc_joiningtype ( utf8proc_int32_t nCode )
+{
+	utf8proc_category_t nCategory ;
+	utf8proc_int32_t *aForms ;
+	if ( (nCode == RING_UTF8PROC_TATWEEL) || (nCode == RING_UTF8PROC_ZWJ) ) {
+		return RING_UTF8PROC_JOINCAUSING ;
+	}
+	if ( nCode == RING_UTF8PROC_ZWNJ ) {
+		return RING_UTF8PROC_JOINNONE ;
+	}
+	if ( (nCode >= RING_UTF8PROC_SHAPEFIRST) && (nCode <= RING_UTF8PROC_SHAPELAST) ) {
+		aForms = aRingUTF8ProcForms[nCode - RING_UTF8PROC_SHAPEFIRST] ;
+		if ( aForms[2] || aForms[3] ) {
+			return RING_UTF8PROC_JOINDUAL ;
+		}
+		if ( aForms[1] ) {
+			return RING_UTF8PROC_JOINRIGHT ;
+		}
+	}
+	nCategory = utf8proc_category(nCode);
+	if ( (nCategory == UTF8PROC_CATEGORY_MN) || (nCategory == UTF8PROC_CATEGORY_ME) || (nCategory == UTF8PROC_CATEGORY_CF) ) {
+		return RING_UTF8PROC_JOINTRANSPARENT ;
+	}
+	return RING_UTF8PROC_JOINNONE ;
+}
+
+/* The presentation form (1 isolated, 2 final, 3 initial, 4 medial) of a letter, or 0 */
+static utf8proc_int32_t ringutf8proc_arabicform ( utf8proc_int32_t nCode, int nForm )
+{
+	if ( (nCode < RING_UTF8PROC_SHAPEFIRST) || (nCode > RING_UTF8PROC_SHAPELAST) ||
+	     (nForm < RING_UTF8PROC_FORMISOLATED) || (nForm > RING_UTF8PROC_FORMMEDIAL) ) {
+		return 0 ;
+	}
+	return aRingUTF8ProcForms[nCode - RING_UTF8PROC_SHAPEFIRST][nForm - 1] ;
+}
+
+/* The isolated form of the Lam-Alef ligature for Lam followed by this Alef (the final form is the next codepoint), or 0 */
+static utf8proc_int32_t ringutf8proc_lamalef ( utf8proc_int32_t nAlef )
+{
+	switch ( nAlef ) {
+		case 0x0622 :
+			return 0xFEF5 ;
+		case 0x0623 :
+			return 0xFEF7 ;
+		case 0x0625 :
+			return 0xFEF9 ;
+		case 0x0627 :
+			return 0xFEFB ;
+	}
+	return 0 ;
+}
+
+/* --- utf8proc_arabicjoiningtype(nCode): RING_UTF8PROC_JOINNONE, JOINRIGHT, JOINDUAL, JOINCAUSING or JOINTRANSPARENT --- */
+RING_FUNC(ring_utf8proc_arabicjoiningtype)
+{
+	utf8proc_int32_t nCode ;
+	if ( ringutf8proc_getcodeparameter(pPointer,&nCode) ) {
+		ringutf8proc_buildforms();
+		RING_API_RETNUMBER(ringutf8proc_joiningtype(nCode));
+	}
+}
+
+/* --- utf8proc_arabicform(nCode, nForm): the presentation form of a letter, or 0 --- */
+RING_FUNC(ring_utf8proc_arabicform)
+{
+	if ( RING_API_PARACOUNT != 2 ) {
+		RING_API_ERROR(RING_API_MISS2PARA);
+		return ;
+	}
+	if ( ! ( RING_API_ISNUMBER(1) && RING_API_ISNUMBER(2) ) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return ;
+	}
+	if ( ! ringutf8proc_iscodepoint(pPointer,1) ) {
+		RING_API_ERROR(RING_API_BADPARARANGE);
+		return ;
+	}
+	ringutf8proc_buildforms();
+	RING_API_RETNUMBER(ringutf8proc_arabicform((utf8proc_int32_t) RING_API_GETNUMBER(1),(int) RING_API_GETNUMBER(2)));
+}
+
+/* Add a codepoint (UTF-8) to the buffer */
+static int ringutf8proc_bufferaddcode ( void *pPointer, RingUTF8ProcBuffer *pBuffer, utf8proc_int32_t nCode )
+{
+	utf8proc_uint8_t aChar[RING_UTF8PROC_MAXCHARBYTES] ;
+	return ringutf8proc_bufferadd(pPointer,pBuffer,(const char *) aChar,utf8proc_encode_char(nCode,aChar)) ;
+}
+
+/*
+**  Decode the string into codepoints, and the byte position of each codepoint (aStart[nCount] = nSize)
+**  Returns the number of codepoints, or -1 after raising an error
+*/
+static utf8proc_ssize_t ringutf8proc_decode ( void *pPointer, const char *cStr, utf8proc_ssize_t nSize,
+					      utf8proc_int32_t **pCodes, utf8proc_ssize_t **pStart )
+{
+	utf8proc_int32_t *aCodes ;
+	utf8proc_ssize_t *aStart ;
+	utf8proc_ssize_t nPos, nBytes, nCount ;
+	aCodes = (utf8proc_int32_t *) RING_API_MALLOC(sizeof(utf8proc_int32_t) * (nSize + 1));
+	aStart = (utf8proc_ssize_t *) RING_API_MALLOC(sizeof(utf8proc_ssize_t) * (nSize + 1));
+	if ( (aCodes == NULL) || (aStart == NULL) ) {
+		if ( aCodes != NULL ) {
+			RING_API_FREE(aCodes);
+		}
+		if ( aStart != NULL ) {
+			RING_API_FREE(aStart);
+		}
+		ringutf8proc_error(pPointer,UTF8PROC_ERROR_NOMEM);
+		return -1 ;
+	}
+	nPos = 0 ;
+	nCount = 0 ;
+	while ( (nBytes = ringutf8proc_next(cStr,nSize,nPos,&aCodes[nCount])) > 0 ) {
+		aStart[nCount++] = nPos ;
+		nPos += nBytes ;
+	}
+	if ( nBytes < 0 ) {
+		RING_API_FREE(aCodes);
+		RING_API_FREE(aStart);
+		ringutf8proc_error(pPointer,nBytes);
+		return -1 ;
+	}
+	aStart[nCount] = nSize ;
+	*pCodes = aCodes ;
+	*pStart = aStart ;
+	return nCount ;
+}
+
+/*
+**  utf8proc_arabicshape(cStr): replace the Arabic letters with their presentation forms
+**  (isolated, initial, medial or final) based on the letters around them, and use the Lam-Alef ligatures
+**  For renderers that don't shape Arabic text (game engines, some PDF libraries, Windows Terminal with visual order)
+*/
+RING_FUNC(ring_utf8proc_arabicshape)
+{
+	RingUTF8ProcBuffer oBuffer ;
+	const char *cStr ;
+	utf8proc_int32_t *aCodes ;
+	utf8proc_ssize_t *aStart ;
+	unsigned char *aTypes ;
+	utf8proc_ssize_t nSize, nCount, x, y, nPrev, nNext ;
+	utf8proc_int32_t nCode, nShaped, nLigature ;
+	int nType, lPrev, lNext, nForm, lOK ;
+	if ( ! ringutf8proc_checkstring(pPointer) ) {
+		return ;
+	}
+	cStr = RING_API_GETSTRING(1);
+	nSize = RING_API_GETSTRINGSIZE(1);
+	nCount = ringutf8proc_decode(pPointer,cStr,nSize,&aCodes,&aStart);
+	if ( nCount < 0 ) {
+		return ;
+	}
+	RING_API_FREE(aStart);
+	aTypes = (unsigned char *) RING_API_MALLOC(nCount + 1);
+	if ( aTypes == NULL ) {
+		RING_API_FREE(aCodes);
+		ringutf8proc_error(pPointer,UTF8PROC_ERROR_NOMEM);
+		return ;
+	}
+	ringutf8proc_buildforms();
+	for ( x = 0 ; x < nCount ; x++ ) {
+		aTypes[x] = (unsigned char) ringutf8proc_joiningtype(aCodes[x]);
+	}
+	if ( ! ringutf8proc_bufferinit(pPointer,&oBuffer,nSize) ) {
+		RING_API_FREE(aCodes);
+		RING_API_FREE(aTypes);
+		return ;
+	}
+	lOK = 1 ;
+	for ( x = 0 ; lOK && (x < nCount) ; x++ ) {
+		nCode = aCodes[x] ;
+		nType = aTypes[x] ;
+		if ( (nType != RING_UTF8PROC_JOINRIGHT) && (nType != RING_UTF8PROC_JOINDUAL) ) {
+			lOK = ringutf8proc_bufferaddcode(pPointer,&oBuffer,nCode);
+			continue ;
+		}
+		/* The letters before and after (the transparent marks between them are skipped) */
+		nPrev = x - 1 ;
+		while ( (nPrev >= 0) && (aTypes[nPrev] == RING_UTF8PROC_JOINTRANSPARENT) ) {
+			nPrev-- ;
+		}
+		nNext = x + 1 ;
+		while ( (nNext < nCount) && (aTypes[nNext] == RING_UTF8PROC_JOINTRANSPARENT) ) {
+			nNext++ ;
+		}
+		lPrev = (nPrev >= 0) && ((aTypes[nPrev] == RING_UTF8PROC_JOINDUAL) || (aTypes[nPrev] == RING_UTF8PROC_JOINCAUSING)) ;
+		/* Lam followed by Alef: the Lam-Alef ligature, then the marks of the Lam */
+		if ( (nCode == RING_UTF8PROC_LAM) && (nNext < nCount) && ((nLigature = ringutf8proc_lamalef(aCodes[nNext])) != 0) ) {
+			lOK = ringutf8proc_bufferaddcode(pPointer,&oBuffer,nLigature + (lPrev ? 1 : 0));
+			for ( y = x + 1 ; lOK && (y < nNext) ; y++ ) {
+				lOK = ringutf8proc_bufferaddcode(pPointer,&oBuffer,aCodes[y]);
+			}
+			x = nNext ;
+			continue ;
+		}
+		lNext = (nType == RING_UTF8PROC_JOINDUAL) && (nNext < nCount) &&
+			((aTypes[nNext] == RING_UTF8PROC_JOINRIGHT) || (aTypes[nNext] == RING_UTF8PROC_JOINDUAL) ||
+			 (aTypes[nNext] == RING_UTF8PROC_JOINCAUSING)) ;
+		if ( lPrev && lNext ) {
+			nForm = RING_UTF8PROC_FORMMEDIAL ;
+		}
+		else if ( lPrev ) {
+			nForm = RING_UTF8PROC_FORMFINAL ;
+		}
+		else if ( lNext ) {
+			nForm = RING_UTF8PROC_FORMINITIAL ;
+		}
+		else {
+			nForm = RING_UTF8PROC_FORMISOLATED ;
+		}
+		nShaped = ringutf8proc_arabicform(nCode,nForm);
+		if ( nShaped == 0 ) {
+			nShaped = ringutf8proc_arabicform(nCode,RING_UTF8PROC_FORMISOLATED);
+		}
+		if ( nShaped == 0 ) {
+			nShaped = nCode ;
+		}
+		lOK = ringutf8proc_bufferaddcode(pPointer,&oBuffer,nShaped);
+	}
+	RING_API_FREE(aCodes);
+	RING_API_FREE(aTypes);
+	if ( lOK ) {
+		ringutf8proc_bufferreturn(pPointer,&oBuffer);
+	}
+}
+
+/* ========================================================================== */
+/*  Bidirectional Text (visual order)                                         */
+/* ========================================================================== */
+
+/* The mirrored characters used in right-to-left text */
+static const utf8proc_int32_t aRingUTF8ProcMirrors[][2] = {
+	{ 0x0028, 0x0029 }, { 0x003C, 0x003E }, { 0x005B, 0x005D }, { 0x007B, 0x007D }, { 0x00AB, 0x00BB },
+	{ 0x2039, 0x203A }, { 0x2045, 0x2046 }, { 0x207D, 0x207E }, { 0x208D, 0x208E }, { 0x2264, 0x2265 },
+	{ 0x2329, 0x232A }, { 0x27E8, 0x27E9 }, { 0x27EA, 0x27EB }, { 0x3008, 0x3009 }, { 0x300A, 0x300B },
+	{ 0x300C, 0x300D }, { 0x300E, 0x300F }, { 0x3010, 0x3011 }, { 0xFF08, 0xFF09 }, { 0xFF1C, 0xFF1E },
+	{ 0xFF3B, 0xFF3D }, { 0xFF5B, 0xFF5D }
+} ;
+
+static utf8proc_int32_t ringutf8proc_mirror ( utf8proc_int32_t nCode )
+{
+	unsigned int x ;
+	for ( x = 0 ; x < sizeof(aRingUTF8ProcMirrors) / sizeof(aRingUTF8ProcMirrors[0]) ; x++ ) {
+		if ( aRingUTF8ProcMirrors[x][0] == nCode ) {
+			return aRingUTF8ProcMirrors[x][1] ;
+		}
+		if ( aRingUTF8ProcMirrors[x][1] == nCode ) {
+			return aRingUTF8ProcMirrors[x][0] ;
+		}
+	}
+	return nCode ;
+}
+
+/* Return true for the explicit formatting characters (embeddings, overrides and isolates) */
+static int ringutf8proc_isexplicit ( int nClass )
+{
+	return (nClass == UTF8PROC_BIDI_CLASS_LRE) || (nClass == UTF8PROC_BIDI_CLASS_RLE) || (nClass == UTF8PROC_BIDI_CLASS_LRO) ||
+	       (nClass == UTF8PROC_BIDI_CLASS_RLO) || (nClass == UTF8PROC_BIDI_CLASS_PDF) || (nClass == UTF8PROC_BIDI_CLASS_LRI) ||
+	       (nClass == UTF8PROC_BIDI_CLASS_RLI) || (nClass == UTF8PROC_BIDI_CLASS_FSI) || (nClass == UTF8PROC_BIDI_CLASS_PDI) ;
+}
+
+/* Return true for the neutral classes used by the rules N1 and N2 */
+static int ringutf8proc_isneutral ( int nClass )
+{
+	return (nClass == UTF8PROC_BIDI_CLASS_B) || (nClass == UTF8PROC_BIDI_CLASS_S) || (nClass == UTF8PROC_BIDI_CLASS_WS) ||
+	       (nClass == UTF8PROC_BIDI_CLASS_ON) ;
+}
+
+/* The strong direction (L or R) of a resolved class for the rules N1 and N2: numbers count as R */
+static int ringutf8proc_strongclass ( int nClass )
+{
+	if ( nClass == UTF8PROC_BIDI_CLASS_L ) {
+		return UTF8PROC_BIDI_CLASS_L ;
+	}
+	if ( (nClass == UTF8PROC_BIDI_CLASS_R) || (nClass == UTF8PROC_BIDI_CLASS_EN) || (nClass == UTF8PROC_BIDI_CLASS_AN) ) {
+		return UTF8PROC_BIDI_CLASS_R ;
+	}
+	return 0 ;
+}
+
+/*
+**  Resolve the levels of one line (codepoints nStart to nEnd - 1) using the rules W1 to W7, N1, N2, I1, I2 and L1
+**  of the Unicode Bidirectional Algorithm (UAX 9); the explicit embeddings and isolates are not supported
+*/
+static void ringutf8proc_bidilevels ( utf8proc_int32_t *aCodes, int *aClass, int *aOriginal, unsigned char *aLevel,
+				      utf8proc_ssize_t nStart, utf8proc_ssize_t nEnd, int nDirection )
+{
+	utf8proc_ssize_t x, y, nRunEnd ;
+	int nBase, nSos, nLast, nBefore, nAfter, nClass ;
+	/* The paragraph level: the first strong character, or the direction parameter */
+	nBase = 0 ;
+	if ( nDirection == RING_UTF8PROC_DIRECTIONRTL ) {
+		nBase = 1 ;
+	}
+	else if ( nDirection != RING_UTF8PROC_DIRECTIONLTR ) {
+		for ( x = nStart ; x < nEnd ; x++ ) {
+			nClass = utf8proc_get_property(aCodes[x])->bidi_class ;
+			if ( nClass == UTF8PROC_BIDI_CLASS_L ) {
+				break ;
+			}
+			if ( (nClass == UTF8PROC_BIDI_CLASS_R) || (nClass == UTF8PROC_BIDI_CLASS_AL) ) {
+				nBase = 1 ;
+				break ;
+			}
+		}
+	}
+	nSos = nBase ? UTF8PROC_BIDI_CLASS_R : UTF8PROC_BIDI_CLASS_L ;
+	for ( x = nStart ; x < nEnd ; x++ ) {
+		aOriginal[x] = utf8proc_get_property(aCodes[x])->bidi_class ;
+		aClass[x] = aOriginal[x] ;
+		if ( ringutf8proc_isexplicit(aClass[x]) ) {
+			aClass[x] = UTF8PROC_BIDI_CLASS_BN ;
+		}
+	}
+	/* W1: a mark (and a boundary neutral) takes the class of the previous character */
+	for ( x = nStart ; x < nEnd ; x++ ) {
+		if ( (aClass[x] == UTF8PROC_BIDI_CLASS_NSM) || (aClass[x] == UTF8PROC_BIDI_CLASS_BN) ) {
+			aClass[x] = (x == nStart) ? nSos : aClass[x - 1] ;
+		}
+	}
+	/* W2: a European number after an Arabic letter is an Arabic number. W3: AL becomes R */
+	nLast = nSos ;
+	for ( x = nStart ; x < nEnd ; x++ ) {
+		nClass = aClass[x] ;
+		if ( (nClass == UTF8PROC_BIDI_CLASS_L) || (nClass == UTF8PROC_BIDI_CLASS_R) || (nClass == UTF8PROC_BIDI_CLASS_AL) ) {
+			nLast = nClass ;
+		}
+		else if ( (nClass == UTF8PROC_BIDI_CLASS_EN) && (nLast == UTF8PROC_BIDI_CLASS_AL) ) {
+			aClass[x] = UTF8PROC_BIDI_CLASS_AN ;
+		}
+	}
+	for ( x = nStart ; x < nEnd ; x++ ) {
+		if ( aClass[x] == UTF8PROC_BIDI_CLASS_AL ) {
+			aClass[x] = UTF8PROC_BIDI_CLASS_R ;
+		}
+	}
+	/* W4: one separator between two numbers of the same type joins them (1,000 and 1.5) */
+	for ( x = nStart + 1 ; x + 1 < nEnd ; x++ ) {
+		if ( (aClass[x - 1] == UTF8PROC_BIDI_CLASS_EN) && (aClass[x + 1] == UTF8PROC_BIDI_CLASS_EN) &&
+		     ((aClass[x] == UTF8PROC_BIDI_CLASS_ES) || (aClass[x] == UTF8PROC_BIDI_CLASS_CS)) ) {
+			aClass[x] = UTF8PROC_BIDI_CLASS_EN ;
+		}
+		else if ( (aClass[x - 1] == UTF8PROC_BIDI_CLASS_AN) && (aClass[x + 1] == UTF8PROC_BIDI_CLASS_AN) &&
+			  (aClass[x] == UTF8PROC_BIDI_CLASS_CS) ) {
+			aClass[x] = UTF8PROC_BIDI_CLASS_AN ;
+		}
+	}
+	/* W5: terminators (like % and $) next to European numbers are European numbers */
+	for ( x = nStart ; x < nEnd ; x++ ) {
+		if ( aClass[x] != UTF8PROC_BIDI_CLASS_ET ) {
+			continue ;
+		}
+		nRunEnd = x ;
+		while ( (nRunEnd < nEnd) && (aClass[nRunEnd] == UTF8PROC_BIDI_CLASS_ET) ) {
+			nRunEnd++ ;
+		}
+		if ( ((x > nStart) && (aClass[x - 1] == UTF8PROC_BIDI_CLASS_EN)) ||
+		     ((nRunEnd < nEnd) && (aClass[nRunEnd] == UTF8PROC_BIDI_CLASS_EN)) ) {
+			for ( y = x ; y < nRunEnd ; y++ ) {
+				aClass[y] = UTF8PROC_BIDI_CLASS_EN ;
+			}
+		}
+		x = nRunEnd - 1 ;
+	}
+	/* W6: the other separators and terminators are neutrals. W7: European numbers after L are L */
+	nLast = nSos ;
+	for ( x = nStart ; x < nEnd ; x++ ) {
+		nClass = aClass[x] ;
+		if ( (nClass == UTF8PROC_BIDI_CLASS_ES) || (nClass == UTF8PROC_BIDI_CLASS_ET) || (nClass == UTF8PROC_BIDI_CLASS_CS) ) {
+			aClass[x] = UTF8PROC_BIDI_CLASS_ON ;
+		}
+		else if ( (nClass == UTF8PROC_BIDI_CLASS_L) || (nClass == UTF8PROC_BIDI_CLASS_R) ) {
+			nLast = nClass ;
+		}
+		else if ( (nClass == UTF8PROC_BIDI_CLASS_EN) && (nLast == UTF8PROC_BIDI_CLASS_L) ) {
+			aClass[x] = UTF8PROC_BIDI_CLASS_L ;
+		}
+	}
+	/* N1 and N2: neutrals between characters of the same direction take it, the others take the paragraph direction */
+	for ( x = nStart ; x < nEnd ; x++ ) {
+		if ( ! ringutf8proc_isneutral(aClass[x]) ) {
+			continue ;
+		}
+		nRunEnd = x ;
+		while ( (nRunEnd < nEnd) && ringutf8proc_isneutral(aClass[nRunEnd]) ) {
+			nRunEnd++ ;
+		}
+		nBefore = (x > nStart) ? ringutf8proc_strongclass(aClass[x - 1]) : nSos ;
+		nAfter = (nRunEnd < nEnd) ? ringutf8proc_strongclass(aClass[nRunEnd]) : nSos ;
+		nClass = ((nBefore != 0) && (nBefore == nAfter)) ? nBefore : nSos ;
+		for ( y = x ; y < nRunEnd ; y++ ) {
+			aClass[y] = nClass ;
+		}
+		x = nRunEnd - 1 ;
+	}
+	/* I1 and I2: the levels */
+	for ( x = nStart ; x < nEnd ; x++ ) {
+		nClass = aClass[x] ;
+		if ( nBase == 0 ) {
+			if ( nClass == UTF8PROC_BIDI_CLASS_R ) {
+				aLevel[x] = 1 ;
+			}
+			else if ( (nClass == UTF8PROC_BIDI_CLASS_AN) || (nClass == UTF8PROC_BIDI_CLASS_EN) ) {
+				aLevel[x] = 2 ;
+			}
+			else {
+				aLevel[x] = 0 ;
+			}
+		}
+		else {
+			aLevel[x] = ((nClass == UTF8PROC_BIDI_CLASS_L) || (nClass == UTF8PROC_BIDI_CLASS_AN) ||
+				     (nClass == UTF8PROC_BIDI_CLASS_EN)) ? 2 : 1 ;
+		}
+	}
+	/* L1: tabs, and the white space before them and at the end of the line, use the paragraph level */
+	for ( x = nEnd - 1 ; x >= nStart ; x-- ) {
+		nClass = aOriginal[x] ;
+		if ( (nClass == UTF8PROC_BIDI_CLASS_WS) || (nClass == UTF8PROC_BIDI_CLASS_S) || (nClass == UTF8PROC_BIDI_CLASS_BN) ||
+		     ringutf8proc_isexplicit(nClass) ) {
+			aLevel[x] = (unsigned char) nBase ;
+		}
+		else {
+			break ;
+		}
+	}
+	for ( x = nStart ; x < nEnd ; x++ ) {
+		if ( aOriginal[x] == UTF8PROC_BIDI_CLASS_S ) {
+			aLevel[x] = (unsigned char) nBase ;
+			for ( y = x - 1 ; (y >= nStart) && (aOriginal[y] == UTF8PROC_BIDI_CLASS_WS) ; y-- ) {
+				aLevel[y] = (unsigned char) nBase ;
+			}
+		}
+	}
+}
+
+/* Reverse the items nFirst to nLast of the cluster list */
+static void ringutf8proc_reverseclusters ( utf8proc_ssize_t *aClusters, utf8proc_ssize_t nFirst, utf8proc_ssize_t nLast )
+{
+	utf8proc_ssize_t nTemp ;
+	while ( nFirst < nLast ) {
+		nTemp = aClusters[nFirst] ;
+		aClusters[nFirst++] = aClusters[nLast] ;
+		aClusters[nLast--] = nTemp ;
+	}
+}
+
+/*
+**  utf8proc_bidivisual(cStr, nDirection): reorder the text from logical order (the order of reading)
+**  to visual order (left to right on the screen), line by line
+**  nDirection: RING_UTF8PROC_DIRECTIONAUTO (the first strong character), DIRECTIONLTR or DIRECTIONRTL
+**  Grapheme clusters are kept together (a letter stays before its marks) and brackets are mirrored in RTL runs
+*/
+RING_FUNC(ring_utf8proc_bidivisual)
+{
+	RingUTF8ProcBuffer oBuffer ;
+	const char *cStr ;
+	utf8proc_int32_t *aCodes ;
+	utf8proc_ssize_t *aStart, *aClusters ;
+	int *aClass, *aOriginal ;
+	unsigned char *aLevel, *aIsStart ;
+	utf8proc_ssize_t nSize, nCount, x, nLineStart, nLineEnd, nClusters, nFirst, nLast, nIndex, nCodeEnd ;
+	utf8proc_int32_t nState, nCode ;
+	int nDirection, nLevel, nMaxLevel, nMinOddLevel, lOK ;
+	if ( RING_API_PARACOUNT != 2 ) {
+		RING_API_ERROR(RING_API_MISS2PARA);
+		return ;
+	}
+	if ( ! ( RING_API_ISSTRING(1) && RING_API_ISNUMBER(2) ) ) {
+		RING_API_ERROR(RING_API_BADPARATYPE);
+		return ;
+	}
+	nDirection = (int) RING_API_GETNUMBER(2);
+	if ( (nDirection < RING_UTF8PROC_DIRECTIONAUTO) || (nDirection > RING_UTF8PROC_DIRECTIONRTL) ) {
+		RING_API_ERROR(RING_API_BADPARARANGE);
+		return ;
+	}
+	cStr = RING_API_GETSTRING(1);
+	nSize = RING_API_GETSTRINGSIZE(1);
+	nCount = ringutf8proc_decode(pPointer,cStr,nSize,&aCodes,&aStart);
+	if ( nCount < 0 ) {
+		return ;
+	}
+	aClass = (int *) RING_API_MALLOC(sizeof(int) * (nCount + 1));
+	aOriginal = (int *) RING_API_MALLOC(sizeof(int) * (nCount + 1));
+	aLevel = (unsigned char *) RING_API_MALLOC(nCount + 1);
+	aIsStart = (unsigned char *) RING_API_MALLOC(nCount + 1);
+	aClusters = (utf8proc_ssize_t *) RING_API_MALLOC(sizeof(utf8proc_ssize_t) * (nCount + 1));
+	lOK = (aClass != NULL) && (aOriginal != NULL) && (aLevel != NULL) && (aIsStart != NULL) && (aClusters != NULL) ;
+	if ( lOK ) {
+		lOK = ringutf8proc_bufferinit(pPointer,&oBuffer,nSize);
+	}
+	else {
+		ringutf8proc_error(pPointer,UTF8PROC_ERROR_NOMEM);
+	}
+	if ( lOK ) {
+		/* The first codepoint of each grapheme cluster */
+		nState = 0 ;
+		for ( x = 0 ; x < nCount ; x++ ) {
+			aIsStart[x] = (x == 0) || utf8proc_grapheme_break_stateful(aCodes[x - 1],aCodes[x],&nState) ;
+		}
+		nLineStart = 0 ;
+		while ( lOK && (nLineStart <= nCount) ) {
+			/* A line ends before a paragraph separator (like LF or CR) */
+			nLineEnd = nLineStart ;
+			while ( (nLineEnd < nCount) && (utf8proc_get_property(aCodes[nLineEnd])->bidi_class != UTF8PROC_BIDI_CLASS_B) ) {
+				nLineEnd++ ;
+			}
+			ringutf8proc_bidilevels(aCodes,aClass,aOriginal,aLevel,nLineStart,nLineEnd,nDirection);
+			/* The clusters of the line, with the level of their first codepoint */
+			nClusters = 0 ;
+			nMaxLevel = 0 ;
+			nMinOddLevel = 255 ;
+			for ( x = nLineStart ; x < nLineEnd ; x++ ) {
+				if ( aIsStart[x] || (x == nLineStart) ) {
+					aClusters[nClusters++] = x ;
+					nLevel = aLevel[x] ;
+					if ( nLevel > nMaxLevel ) {
+						nMaxLevel = nLevel ;
+					}
+					if ( (nLevel % 2 == 1) && (nLevel < nMinOddLevel) ) {
+						nMinOddLevel = nLevel ;
+					}
+				}
+			}
+			/* L2: from the highest level to the lowest odd level, reverse the runs at that level or higher */
+			for ( nLevel = nMaxLevel ; nLevel >= nMinOddLevel ; nLevel-- ) {
+				nFirst = 0 ;
+				while ( nFirst < nClusters ) {
+					if ( aLevel[aClusters[nFirst]] < nLevel ) {
+						nFirst++ ;
+						continue ;
+					}
+					nLast = nFirst ;
+					while ( (nLast + 1 < nClusters) && (aLevel[aClusters[nLast + 1]] >= nLevel) ) {
+						nLast++ ;
+					}
+					ringutf8proc_reverseclusters(aClusters,nFirst,nLast);
+					nFirst = nLast + 1 ;
+				}
+			}
+			/* Add the clusters in visual order (L4: mirror the brackets of right-to-left clusters) */
+			for ( x = 0 ; lOK && (x < nClusters) ; x++ ) {
+				nIndex = aClusters[x] ;
+				nCodeEnd = nIndex + 1 ;
+				while ( (nCodeEnd < nLineEnd) && ( ! aIsStart[nCodeEnd] ) ) {
+					nCodeEnd++ ;
+				}
+				nCode = aCodes[nIndex] ;
+				if ( (aLevel[nIndex] % 2 == 1) && utf8proc_get_property(nCode)->bidi_mirrored &&
+				     (ringutf8proc_mirror(nCode) != nCode) ) {
+					lOK = ringutf8proc_bufferaddcode(pPointer,&oBuffer,ringutf8proc_mirror(nCode));
+					if ( lOK && (nCodeEnd > nIndex + 1) ) {
+						lOK = ringutf8proc_bufferadd(pPointer,&oBuffer,cStr + aStart[nIndex + 1],aStart[nCodeEnd] - aStart[nIndex + 1]);
+					}
+				}
+				else {
+					lOK = ringutf8proc_bufferadd(pPointer,&oBuffer,cStr + aStart[nIndex],aStart[nCodeEnd] - aStart[nIndex]);
+				}
+			}
+			/* The paragraph separator stays at the end of the line */
+			if ( lOK && (nLineEnd < nCount) ) {
+				lOK = ringutf8proc_bufferadd(pPointer,&oBuffer,cStr + aStart[nLineEnd],aStart[nLineEnd + 1] - aStart[nLineEnd]);
+			}
+			nLineStart = nLineEnd + 1 ;
+		}
+		if ( lOK ) {
+			ringutf8proc_bufferreturn(pPointer,&oBuffer);
+		}
+	}
+	RING_API_FREE(aCodes);
+	RING_API_FREE(aStart);
+	if ( aClass != NULL ) {
+		RING_API_FREE(aClass);
+	}
+	if ( aOriginal != NULL ) {
+		RING_API_FREE(aOriginal);
+	}
+	if ( aLevel != NULL ) {
+		RING_API_FREE(aLevel);
+	}
+	if ( aIsStart != NULL ) {
+		RING_API_FREE(aIsStart);
+	}
+	if ( aClusters != NULL ) {
+		RING_API_FREE(aClusters);
+	}
+}
+</code>
